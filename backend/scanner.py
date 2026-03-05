@@ -1,8 +1,8 @@
 """
-FinanceDataReader 기반 한국 주식 스캔 엔진
+pykrx 기반 한국 주식 스캔 엔진
 KOSPI/KOSDAQ 전종목에서 기술적 분석 조건 필터링
 """
-import FinanceDataReader as fdr
+from pykrx import stock as krx
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -16,46 +16,24 @@ logger = logging.getLogger(__name__)
 _cache = {'data': None, 'timestamp': 0}
 CACHE_TTL = 300
 
-# FinanceDataReader 업종명 → 앱 섹터명 매핑
-SECTOR_ALIAS = {
-    '화학': '2차전지/전기차',
-    '전기전자': '반도체',
-    '전기,전자': '반도체',
-    '전기·전자': '반도체',
-    '서비스업': 'IT/소프트웨어',
-    '소프트웨어': 'IT/소프트웨어',
-    '통신업': 'IT/소프트웨어',
-    '의약품': '바이오/제약',
-    '의료정밀': '바이오/제약',
-    '의료·정밀기기': '바이오/제약',
-    '운수장비': '자동차',
-    '건설업': '건설',
-    '금융업': '금융',
-    '은행': '금융',
-    '보험': '금융',
-    '증권': '금융',
-    '철강금속': '철강/소재',
-    '철강·금속': '철강/소재',
-    '철강,금속': '철강/소재',
-    '비금속광물': '철강/소재',
-}
-
-APP_SECTORS = [
-    '2차전지/전기차', '반도체', 'IT/소프트웨어', '바이오/제약',
-    '자동차', '건설', '금융', '철강/소재',
+# KOSPI 업종 지수 코드 매핑
+SECTOR_INDEX_MAP = [
+    ('2차전지/전기차', '1008'),   # 화학
+    ('반도체',         '1013'),   # 전기전자
+    ('IT/소프트웨어',  '1025'),   # 서비스업
+    ('바이오/제약',    '1009'),   # 의약품
+    ('자동차',         '1015'),   # 운수장비
+    ('건설',           '1018'),   # 건설업
+    ('금융',           '1021'),   # 금융업
+    ('철강/소재',      '1011'),   # 철강금속
 ]
+
+APP_SECTORS = [name for name, _ in SECTOR_INDEX_MAP]
 
 
 # ─────────────────────────────────────────
 # 유틸리티
 # ─────────────────────────────────────────
-
-def find_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
 
 def safe_float(val, default=0.0):
     try:
@@ -77,39 +55,70 @@ def calc_ma(series, period):
     return float(series.iloc[-period:].mean())
 
 
+def get_col(df, candidates, fallback_idx=None):
+    """컬럼명 후보 중 존재하는 첫 번째 반환, 없으면 fallback_idx 인덱스 컬럼 사용"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if fallback_idx is not None and len(df.columns) > fallback_idx:
+        return df.columns[fallback_idx]
+    return None
+
+
+# ─────────────────────────────────────────
+# 마지막 거래일 탐지
+# ─────────────────────────────────────────
+
+def get_last_trading_date():
+    for i in range(10):
+        d = datetime.today() - timedelta(days=i)
+        date_str = d.strftime('%Y%m%d')
+        try:
+            df = krx.get_market_ohlcv_by_ticker(date_str, market='KOSPI')
+            if df is not None and len(df) > 100:
+                return date_str
+        except Exception:
+            continue
+    return (datetime.today() - timedelta(days=1)).strftime('%Y%m%d')
+
+
 # ─────────────────────────────────────────
 # 개별 종목 기술적 분석
 # ─────────────────────────────────────────
 
 def process_stock(info):
-    ticker = info['ticker']
-    name = info['name']
-    sector_raw = info.get('sector', '')
-    price = info['price']
-    change = info.get('change', 0.0)
-    volume = info.get('volume', 0)
-    market_cap = info.get('marketCap', 0)   # 억 단위
-    per = info.get('per', 0.0)
-    pbr = info.get('pbr', 0.0)
-    shares = info.get('shares', 0)
+    ticker  = info['ticker']
+    name    = info['name']
+    price   = info['price']
+    volume  = info['volume']
+    market_cap = info['marketCap']
+    per     = info['per']
+    pbr     = info['pbr']
 
     try:
-        end_dt = datetime.today().strftime('%Y-%m-%d')
-        start_dt = (datetime.today() - timedelta(days=420)).strftime('%Y-%m-%d')
-        hist = fdr.DataReader(ticker, start_dt, end_dt)
+        end_dt   = datetime.today().strftime('%Y%m%d')
+        start_dt = (datetime.today() - timedelta(days=420)).strftime('%Y%m%d')
 
+        hist = krx.get_market_ohlcv_by_date(start_dt, end_dt, ticker)
         if hist is None or len(hist) < 20:
             return None
 
-        close = hist['Close'].astype(float)
-        vol_series = hist['Volume'].astype(float) if 'Volume' in hist.columns else pd.Series([volume] * len(hist))
+        # pykrx 컬럼: 시가, 고가, 저가, 종가, 거래량
+        close_col = get_col(hist, ['종가', 'Close'], fallback_idx=3)
+        vol_col   = get_col(hist, ['거래량', 'Volume'], fallback_idx=4)
 
-        ma50 = round(calc_ma(close, 50))
+        close = hist[close_col].astype(float)
+        vol_series = hist[vol_col].astype(float)
+
+        ma50  = round(calc_ma(close, 50))
         ma150 = round(calc_ma(close, 150))
         ma200 = round(calc_ma(close, 200))
 
         # MA200 트렌드 (20일 전 대비)
-        ma200_20ago = round(float(close.iloc[:-20].iloc[-200:].mean())) if len(close) >= 220 else ma200
+        if len(close) >= 220:
+            ma200_20ago = float(close.iloc[:-20].iloc[-200:].mean())
+        else:
+            ma200_20ago = ma200
         ma200_trend = 'up' if (ma200 > 0 and ma200 > ma200_20ago) else 'down'
 
         # 평균 거래량 20일
@@ -119,7 +128,7 @@ def process_stock(info):
         # 52주 고/저가
         n = min(len(close), 252)
         week52_high = round(float(close.iloc[-n:].max()))
-        week52_low = round(float(close.iloc[-n:].min()))
+        week52_low  = round(float(close.iloc[-n:].min()))
 
         # 수익률
         def calc_return(days):
@@ -128,9 +137,9 @@ def process_stock(info):
             past = float(close.iloc[-days])
             return round((price - past) / past * 100, 1) if past > 0 else 0
 
-        return1m = calc_return(20)
-        return3m = calc_return(60)
-        return6m = calc_return(120)
+        return1m  = calc_return(20)
+        return3m  = calc_return(60)
+        return6m  = calc_return(120)
         return12m = calc_return(240)
 
         # Weinstein Stage
@@ -158,21 +167,20 @@ def process_stock(info):
                 vcp = ranges[0] > ranges[1] > ranges[2] and ranges[2] < 10
 
         # Darvas Box
-        darvas_clear = False
+        darvas_clear    = False
         darvas_breakout = False
         if len(close) >= 20:
-            recent20 = close.iloc[-20:]
-            box_high = float(recent20.max())
-            box_low = float(recent20.min())
+            recent20  = close.iloc[-20:]
+            box_high  = float(recent20.max())
+            box_low   = float(recent20.min())
             if box_high > 0:
-                box_range = (box_high - box_low) / box_high * 100
-                darvas_clear = 3 < box_range < 20
+                box_range       = (box_high - box_low) / box_high * 100
+                darvas_clear    = 3 < box_range < 20
                 darvas_breakout = price > box_high and volume_ratio > 200
 
-        recent_drop = calc_return(5)
-        is_breakout = week52_high > 0 and price >= week52_high * 0.97
-        app_sector = SECTOR_ALIAS.get(sector_raw, sector_raw)
-        ma30w_slope = (
+        recent_drop  = calc_return(5)
+        is_breakout  = week52_high > 0 and price >= week52_high * 0.97
+        ma30w_slope  = (
             'strong_up' if (ma200 > 0 and ma200_20ago > 0 and ma200 > ma200_20ago * 1.02)
             else ('up' if ma200_trend == 'up' else 'down')
         )
@@ -180,14 +188,14 @@ def process_stock(info):
         return {
             'ticker': ticker,
             'name': name,
-            'sector': app_sector,
+            'sector': info.get('sector', ''),
             'price': int(price),
-            'change': round(change, 2),
+            'change': round(info.get('change', 0.0), 2),
             'volume': int(volume),
             'volumeRatio': int(volume_ratio),
             'marketCap': int(market_cap),
-            'sharesOutstanding': int(shares),
-            # FinanceDataReader는 수급 데이터 미제공 → 0으로 설정
+            'sharesOutstanding': int(info.get('shares', 0)),
+            # pykrx는 수급 데이터 미제공 → 0
             'instNetBuy': 0,
             'foreignNetBuy': 0,
             'retailNetBuy': 0,
@@ -260,27 +268,29 @@ def process_stock(info):
 
 
 # ─────────────────────────────────────────
-# 시장 지수
+# 시장 지수 (KOSPI/KOSDAQ)
 # ─────────────────────────────────────────
 
-def get_market_indices():
+def get_market_indices(date_str):
     try:
-        start = (datetime.today() - timedelta(days=300)).strftime('%Y-%m-%d')
-        end = datetime.today().strftime('%Y-%m-%d')
+        start = (datetime.today() - timedelta(days=300)).strftime('%Y%m%d')
 
-        kospi = fdr.DataReader('KS11', start, end)
-        kosdaq = fdr.DataReader('KQ11', start, end)
+        ki = krx.get_index_ohlcv_by_date(start, date_str, '1001')  # KOSPI
+        kq = krx.get_index_ohlcv_by_date(start, date_str, '2001')  # KOSDAQ
 
-        kospi_price = float(kospi['Close'].iloc[-1])
-        kospi_prev = float(kospi['Close'].iloc[-2]) if len(kospi) > 1 else kospi_price
-        kospi_change = round((kospi_price - kospi_prev) / kospi_prev * 100, 2)
+        close_col = get_col(ki, ['종가', 'Close'], fallback_idx=3)
 
-        kosdaq_price = float(kosdaq['Close'].iloc[-1]) if kosdaq is not None and len(kosdaq) > 0 else 0.0
-        kosdaq_prev = float(kosdaq['Close'].iloc[-2]) if kosdaq is not None and len(kosdaq) > 1 else kosdaq_price
+        kospi_price  = float(ki[close_col].iloc[-1])
+        kospi_prev   = float(ki[close_col].iloc[-2]) if len(ki) > 1 else kospi_price
+        kospi_change = round((kospi_price - kospi_prev) / kospi_prev * 100, 2) if kospi_prev > 0 else 0.0
+
+        qclose_col   = get_col(kq, ['종가', 'Close'], fallback_idx=3)
+        kosdaq_price  = float(kq[qclose_col].iloc[-1]) if kq is not None and len(kq) > 0 else 0.0
+        kosdaq_prev   = float(kq[qclose_col].iloc[-2]) if kq is not None and len(kq) > 1 else kosdaq_price
         kosdaq_change = round((kosdaq_price - kosdaq_prev) / kosdaq_prev * 100, 2) if kosdaq_prev > 0 else 0.0
 
-        kospi_ma200 = float(kospi['Close'].iloc[-200:].mean()) if len(kospi) >= 200 else 0.0
-        kospi_above_200 = bool(kospi_price > kospi_ma200) if kospi_ma200 > 0 else True
+        kospi_ma200    = float(ki[close_col].iloc[-200:].mean()) if len(ki) >= 200 else 0.0
+        kospi_above200 = bool(kospi_price > kospi_ma200) if kospi_ma200 > 0 else True
 
         return {
             'kospi': round(kospi_price, 2),
@@ -288,7 +298,7 @@ def get_market_indices():
             'kosdaq': round(kosdaq_price, 2),
             'kosdaqChange': kosdaq_change,
             'marketStatus': 'live',
-            'kospiAbove200': kospi_above_200,
+            'kospiAbove200': kospi_above200,
         }
     except Exception as e:
         logger.error(f'지수 조회 오류: {e}')
@@ -300,29 +310,26 @@ def get_market_indices():
 
 
 # ─────────────────────────────────────────
-# 업종별 등락률 (종목 목록에서 집계)
+# 업종별 등락률 (KOSPI 업종 지수)
 # ─────────────────────────────────────────
 
-def get_sectors_from_listing(df):
-    change_col = find_col(df, ['ChagesRatio', 'ChangeRatio', 'Changes_ratio', 'change_ratio'])
-    sector_col = find_col(df, ['Sector', 'sector', '업종', 'Industry'])
-
-    if not change_col or not sector_col:
-        logger.warning(f'업종/등락률 컬럼 없음. 가용: {list(df.columns)}')
-        return [{'name': s, 'netBuy': 0, 'change': 0, 'trend': 'neutral'} for s in APP_SECTORS]
-
-    bucket = {}
-    for _, row in df.iterrows():
-        raw = str(row.get(sector_col, ''))
-        app = SECTOR_ALIAS.get(raw)
-        if app:
-            v = safe_float(row.get(change_col, 0))
-            bucket.setdefault(app, []).append(v)
-
+def get_sectors(date_str):
+    start = (datetime.today() - timedelta(days=5)).strftime('%Y%m%d')
     result = []
-    for name in APP_SECTORS:
-        vals = bucket.get(name, [])
-        change = round(sum(vals) / len(vals), 2) if vals else 0.0
+    for name, code in SECTOR_INDEX_MAP:
+        try:
+            df = krx.get_index_ohlcv_by_date(start, date_str, code)
+            if df is None or len(df) < 2:
+                change = 0.0
+            else:
+                close_col = get_col(df, ['종가', 'Close'], fallback_idx=3)
+                last  = float(df[close_col].iloc[-1])
+                prev  = float(df[close_col].iloc[-2])
+                change = round((last - prev) / prev * 100, 2) if prev > 0 else 0.0
+        except Exception as e:
+            logger.warning(f'업종 지수 오류 [{name}/{code}]: {e}')
+            change = 0.0
+
         trend = 'up' if change > 0.5 else ('down' if change < -0.5 else 'neutral')
         result.append({'name': name, 'netBuy': 0, 'change': change, 'trend': trend})
     return result
@@ -343,76 +350,128 @@ def run_scan():
     logger.info('=== 스캔 시작 ===')
     t0 = time.time()
 
-    # 1. 전종목 목록 (오늘 가격 포함)
-    logger.info('KOSPI/KOSDAQ 종목 목록 조회...')
+    date_str = get_last_trading_date()
+    logger.info(f'기준일: {date_str}')
+
+    empty_sectors = [{'name': n, 'netBuy': 0, 'change': 0, 'trend': 'neutral'} for n, _ in SECTOR_INDEX_MAP]
+
+    # 1. 전종목 OHLCV (당일)
+    logger.info('KOSPI/KOSDAQ 전종목 조회...')
     try:
-        kospi_df = fdr.StockListing('KOSPI')
-        kosdaq_df = fdr.StockListing('KOSDAQ')
-        all_df = pd.concat([kospi_df, kosdaq_df], ignore_index=True)
-        logger.info(f'전체 종목: {len(all_df)}개')
+        kospi_ohlcv  = krx.get_market_ohlcv_by_ticker(date_str, market='KOSPI')
+        kosdaq_ohlcv = krx.get_market_ohlcv_by_ticker(date_str, market='KOSDAQ')
     except Exception as e:
-        logger.error(f'StockListing 오류: {e}')
-        empty_sectors = [{'name': s, 'netBuy': 0, 'change': 0, 'trend': 'neutral'} for s in APP_SECTORS]
-        return {'stocks': [], 'market': get_market_indices(), 'sectors': empty_sectors}
+        logger.error(f'전종목 OHLCV 오류: {e}')
+        return {'stocks': [], 'market': get_market_indices(date_str), 'sectors': empty_sectors}
 
-    # 2. 업종별 등락률 (전종목 데이터에서 계산)
-    sectors = get_sectors_from_listing(all_df)
+    # 2. 시가총액 / 상장주식수
+    try:
+        kospi_cap  = krx.get_market_cap_by_ticker(date_str, market='KOSPI')
+        kosdaq_cap = krx.get_market_cap_by_ticker(date_str, market='KOSDAQ')
+    except Exception as e:
+        logger.warning(f'시총 조회 오류: {e}')
+        kospi_cap  = pd.DataFrame()
+        kosdaq_cap = pd.DataFrame()
 
-    # 3. 컬럼 탐지
-    sym_col = find_col(all_df, ['Symbol', 'Code', 'code', '종목코드'])
-    name_col = find_col(all_df, ['Name', 'name', '종목명'])
-    close_col = find_col(all_df, ['Close', 'close', '현재가', 'Adj Close'])
-    vol_col = find_col(all_df, ['Volume', 'volume', '거래량'])
-    marcap_col = find_col(all_df, ['Marcap', 'MarketCap', 'marcap', '시가총액'])
-    change_col = find_col(all_df, ['ChagesRatio', 'ChangeRatio', 'change', '등락률'])
-    sector_col = find_col(all_df, ['Sector', 'sector', '업종', 'Industry'])
-    per_col = find_col(all_df, ['Per', 'PER', 'per'])
-    pbr_col = find_col(all_df, ['Pbr', 'PBR', 'pbr'])
-    stocks_col = find_col(all_df, ['Stocks', 'shares', '상장주식수'])
+    # 3. 펀더멘털 (PER, PBR)
+    try:
+        kospi_fund  = krx.get_market_fundamental_by_ticker(date_str, market='KOSPI')
+        kosdaq_fund = krx.get_market_fundamental_by_ticker(date_str, market='KOSDAQ')
+    except Exception as e:
+        logger.warning(f'펀더멘털 조회 오류: {e}')
+        kospi_fund  = pd.DataFrame()
+        kosdaq_fund = pd.DataFrame()
 
-    if not sym_col or not close_col:
-        logger.error(f'필수 컬럼 없음. 가용: {list(all_df.columns)}')
-        return {'stocks': [], 'market': get_market_indices(), 'sectors': sectors}
+    # 4. 병합 (KOSPI)
+    def merge_market(ohlcv_df, cap_df, fund_df, market_name):
+        if ohlcv_df is None or len(ohlcv_df) == 0:
+            return pd.DataFrame()
+        df = ohlcv_df.copy()
+        df['_market'] = market_name
+        if cap_df is not None and len(cap_df) > 0:
+            cap_cols = {get_col(cap_df, ['시가총액'], fallback_idx=0): '시가총액',
+                        get_col(cap_df, ['상장주식수'], fallback_idx=1): '상장주식수'}
+            for src, dst in cap_cols.items():
+                if src and src in cap_df.columns:
+                    df[dst] = cap_df[src].reindex(df.index).fillna(0)
+        if fund_df is not None and len(fund_df) > 0:
+            for col in ['PER', 'PBR']:
+                if col in fund_df.columns:
+                    df[col] = fund_df[col].reindex(df.index).fillna(0)
+        return df
 
-    # 4. 수치 변환
-    all_df['_close'] = pd.to_numeric(all_df[close_col], errors='coerce').fillna(0)
-    all_df['_vol'] = pd.to_numeric(all_df[vol_col], errors='coerce').fillna(0) if vol_col else 0
-    all_df['_marcap'] = pd.to_numeric(all_df[marcap_col], errors='coerce').fillna(0) if marcap_col else 0
+    kospi_df  = merge_market(kospi_ohlcv,  kospi_cap,  kospi_fund,  'KOSPI')
+    kosdaq_df = merge_market(kosdaq_ohlcv, kosdaq_cap, kosdaq_fund, 'KOSDAQ')
+    all_df    = pd.concat([kospi_df, kosdaq_df], ignore_index=False)
+    logger.info(f'전체 종목: {len(all_df)}개')
 
-    # 5. 필터: 가격 ≥ 1,000원, 시총 ≥ 500억 (Marcap은 원 단위)
+    # 5. 컬럼 탐지
+    close_col  = get_col(all_df, ['종가', 'Close'],       fallback_idx=3)
+    vol_col    = get_col(all_df, ['거래량', 'Volume'],     fallback_idx=4)
+    cap_col    = '시가총액' if '시가총액' in all_df.columns else None
+    shares_col = '상장주식수' if '상장주식수' in all_df.columns else None
+    per_col    = 'PER' if 'PER' in all_df.columns else None
+    pbr_col    = 'PBR' if 'PBR' in all_df.columns else None
+
+    if not close_col:
+        logger.error(f'종가 컬럼 없음. 가용: {list(all_df.columns)}')
+        return {'stocks': [], 'market': get_market_indices(date_str), 'sectors': empty_sectors}
+
+    # 6. 수치 변환
+    all_df['_close']  = pd.to_numeric(all_df[close_col],                       errors='coerce').fillna(0)
+    all_df['_vol']    = pd.to_numeric(all_df[vol_col],   errors='coerce').fillna(0) if vol_col   else 0
+    all_df['_cap']    = pd.to_numeric(all_df[cap_col],   errors='coerce').fillna(0) if cap_col   else 0
+    all_df['_shares'] = pd.to_numeric(all_df[shares_col],errors='coerce').fillna(0) if shares_col else 0
+    all_df['_per']    = pd.to_numeric(all_df[per_col],   errors='coerce').fillna(0) if per_col   else 0
+    all_df['_pbr']    = pd.to_numeric(all_df[pbr_col],   errors='coerce').fillna(0) if pbr_col   else 0
+
+    # 7. 필터: 가격 ≥ 1,000원, 시총 ≥ 500억
     filtered = all_df[
         (all_df['_close'] >= 1_000) &
-        (all_df['_marcap'] >= 50_000_000_000)
+        (all_df['_cap']   >= 50_000_000_000)
     ].copy()
     logger.info(f'기본 필터 후: {len(filtered)}개')
 
     # 거래량 TOP 50
     filtered = filtered.sort_values('_vol', ascending=False).head(50)
 
-    # 6. 종목 정보 정리
+    # 8. 종목 정보 리스트 구성
     stock_infos = []
-    for _, row in filtered.iterrows():
-        ticker = str(row.get(sym_col, '')).strip().zfill(6)
-        if not ticker or ticker == '000000':
+    for ticker, row in filtered.iterrows():
+        ticker_str = str(ticker).strip().zfill(6)
+        if not ticker_str or ticker_str == '000000':
             continue
+        try:
+            name = krx.get_market_ticker_name(ticker_str)
+        except Exception:
+            name = ticker_str
+
+        # 당일 등락률 계산 (시가 → 종가)
+        open_col = get_col(all_df, ['시가', 'Open'], fallback_idx=0)
+        if open_col and open_col in row.index:
+            open_price = safe_float(row.get(open_col, 0))
+            change = round((row['_close'] - open_price) / open_price * 100, 2) if open_price > 0 else 0.0
+        else:
+            change = 0.0
+
         stock_infos.append({
-            'ticker': ticker,
-            'name': str(row.get(name_col, ticker)) if name_col else ticker,
-            'sector': str(row.get(sector_col, '')) if sector_col else '',
-            'price': safe_float(row['_close']),
-            'change': safe_float(row.get(change_col, 0)) if change_col else 0.0,
-            'volume': safe_int(row['_vol']),
-            'marketCap': safe_int(row['_marcap']) // 100_000_000,  # 억 단위
-            'per': safe_float(row.get(per_col, 0)) if per_col else 0.0,
-            'pbr': safe_float(row.get(pbr_col, 0)) if pbr_col else 0.0,
-            'shares': safe_int(row.get(stocks_col, 0)) if stocks_col else 0,
+            'ticker':    ticker_str,
+            'name':      name,
+            'sector':    '',
+            'price':     safe_float(row['_close']),
+            'change':    change,
+            'volume':    safe_int(row['_vol']),
+            'marketCap': safe_int(row['_cap']) // 100_000_000,  # 억 단위
+            'shares':    safe_int(row['_shares']),
+            'per':       safe_float(row['_per']),
+            'pbr':       safe_float(row['_pbr']),
         })
 
     logger.info(f'분석 대상: {len(stock_infos)}개')
 
-    # 7. 병렬 히스토리 조회 + 기술적 분석
+    # 9. 병렬 히스토리 조회 + 기술적 분석
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(process_stock, info): info['ticker'] for info in stock_infos}
         for future in concurrent.futures.as_completed(futures):
             r = future.result()
@@ -422,9 +481,13 @@ def run_scan():
     elapsed = time.time() - t0
     logger.info(f'분석 완료: {len(results)}/{len(stock_infos)}개 ({elapsed:.1f}초)')
 
-    market = get_market_indices()
-    data = {'stocks': results, 'market': market, 'sectors': sectors}
+    # 10. 업종별 지수 등락률
+    sectors = get_sectors(date_str)
 
-    _cache['data'] = data
+    # 11. 시장 지수
+    market = get_market_indices(date_str)
+
+    data = {'stocks': results, 'market': market, 'sectors': sectors}
+    _cache['data']      = data
     _cache['timestamp'] = time.time()
     return data
