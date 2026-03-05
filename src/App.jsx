@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import Header from './components/Header';
 import ScanButton from './components/ScanButton';
 import SignalCard from './components/SignalCard';
@@ -44,11 +44,14 @@ export default function App() {
                 <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">
                   API 오류 발생
                 </h3>
-                <p className="text-sm text-[var(--color-text-secondary)]">
+                <p className="text-sm text-[var(--color-text-secondary)] mb-2">
                   {error}
                 </p>
+                <p className="text-xs text-[var(--color-text-secondary)] mt-2 font-mono bg-[var(--color-bg-secondary)] px-3 py-2 rounded inline-block">
+                  백엔드: {import.meta.env.VITE_BACKEND_URL || '(env 미설정 — localhost:5000)'}
+                </p>
                 <p className="text-xs text-[var(--color-text-secondary)] mt-2">
-                  브라우저 개발자 도구 콘솔에서 상세 오류를 확인하세요.
+                  브라우저 F12 → Console 탭에서 상세 오류를 확인하세요.
                 </p>
               </>
             ) : (

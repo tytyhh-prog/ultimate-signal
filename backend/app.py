@@ -1,6 +1,6 @@
 """
 Ultimate Signal - Python Flask 백엔드
-FinanceDataReader 기반 한국 주식 스캔 API
+pykrx 기반 한국 주식 스캔 API
 """
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -15,12 +15,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins='*')
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+
+# 루트 헬스체크 (Render 모니터링 + 프론트 ping용)
+@app.route('/health', methods=['GET'])
+def health_root():
+    return jsonify({'ok': True, 'status': 'ok'})
 
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'ok': True, 'status': 'ok'})
 
 
 @app.route('/api/scan', methods=['GET'])
