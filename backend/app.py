@@ -46,6 +46,36 @@ def scan():
         }), 500
 
 
+@app.route('/api/debug/yf', methods=['GET'])
+def debug_yf():
+    """yfinance 한국 종목 동작 여부 진단"""
+    import yfinance as yf
+    results = {}
+    test_cases = [
+        ('^KS11', 'KOSPI지수'),
+        ('005930.KS', '삼성전자'),
+        ('000660.KS', 'SK하이닉스'),
+        ('035720.KQ', '카카오'),
+    ]
+    for sym, label in test_cases:
+        try:
+            hist = yf.Ticker(sym).history(period='5d')
+            results[label] = {
+                'ok': True,
+                'rows': len(hist),
+                'last_close': float(hist['Close'].iloc[-1]) if hist is not None and len(hist) > 0 else None,
+            }
+        except Exception as e:
+            results[label] = {'ok': False, 'error': str(e), 'type': type(e).__name__}
+
+    import scanner
+    return jsonify({
+        'market_open': scanner.is_market_open(),
+        'market_status': scanner.get_market_status(),
+        'yfinance_tests': results,
+    })
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
