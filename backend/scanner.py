@@ -285,7 +285,7 @@ def process_stock_yf(ticker, name, market):
     yf_sym = f'{ticker}{suffix}'
     try:
         tick = yf.Ticker(yf_sym)
-        hist = tick.history(period='14mo')
+        hist = tick.history(period='2y')   # yfinance 유효 기간: 1d/5d/1mo/3mo/6mo/1y/2y/5y
         if hist is None or len(hist) < 20:
             logger.warning(f'[{yf_sym}] 히스토리 부족: {len(hist) if hist is not None else 0}행')
             return None
