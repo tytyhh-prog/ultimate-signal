@@ -10,6 +10,13 @@ import concurrent.futures
 import logging
 import time
 
+try:
+    from zoneinfo import ZoneInfo
+    _KST = ZoneInfo('Asia/Seoul')
+except ImportError:
+    import pytz
+    _KST = pytz.timezone('Asia/Seoul')
+
 logger = logging.getLogger(__name__)
 
 # 5분 캐시 (Render free tier 콜드스타트 대비)
@@ -63,6 +70,25 @@ def get_col(df, candidates, fallback_idx=None):
     if fallback_idx is not None and len(df.columns) > fallback_idx:
         return df.columns[fallback_idx]
     return None
+
+
+# ─────────────────────────────────────────
+# KST 기준 장 운영 상태
+# ─────────────────────────────────────────
+
+def get_market_status_kst():
+    """KST 기준 평일 09:00~15:30이면 'open', 아니면 'closed' 반환"""
+    try:
+        now_kst = datetime.now(_KST)
+    except Exception:
+        # timezone 변환 실패 시 UTC+9 수동 계산
+        now_kst = datetime.utcnow() + timedelta(hours=9)
+    if now_kst.weekday() >= 5:  # 토=5, 일=6
+        return 'closed'
+    minutes = now_kst.hour * 60 + now_kst.minute
+    if 9 * 60 <= minutes <= 15 * 60 + 30:
+        return 'open'
+    return 'closed'
 
 
 # ─────────────────────────────────────────
@@ -272,9 +298,11 @@ def process_stock(info):
 # ─────────────────────────────────────────
 
 def get_market_indices(date_str):
+    market_status = get_market_status_kst()
+
+    # ── 1차 시도: pykrx ──────────────────────────────
     try:
         start = (datetime.today() - timedelta(days=300)).strftime('%Y%m%d')
-
         ki = krx.get_index_ohlcv_by_date(start, date_str, '1001')  # KOSPI
         kq = krx.get_index_ohlcv_by_date(start, date_str, '2001')  # KOSDAQ
 
@@ -284,7 +312,7 @@ def get_market_indices(date_str):
         kospi_prev   = float(ki[close_col].iloc[-2]) if len(ki) > 1 else kospi_price
         kospi_change = round((kospi_price - kospi_prev) / kospi_prev * 100, 2) if kospi_prev > 0 else 0.0
 
-        qclose_col   = get_col(kq, ['종가', 'Close'], fallback_idx=3)
+        qclose_col    = get_col(kq, ['종가', 'Close'], fallback_idx=3)
         kosdaq_price  = float(kq[qclose_col].iloc[-1]) if kq is not None and len(kq) > 0 else 0.0
         kosdaq_prev   = float(kq[qclose_col].iloc[-2]) if kq is not None and len(kq) > 1 else kosdaq_price
         kosdaq_change = round((kosdaq_price - kosdaq_prev) / kosdaq_prev * 100, 2) if kosdaq_prev > 0 else 0.0
@@ -292,21 +320,59 @@ def get_market_indices(date_str):
         kospi_ma200    = float(ki[close_col].iloc[-200:].mean()) if len(ki) >= 200 else 0.0
         kospi_above200 = bool(kospi_price > kospi_ma200) if kospi_ma200 > 0 else True
 
+        logger.info(f'pykrx 지수: KOSPI={kospi_price} KOSDAQ={kosdaq_price}')
         return {
             'kospi': round(kospi_price, 2),
             'kospiChange': kospi_change,
             'kosdaq': round(kosdaq_price, 2),
             'kosdaqChange': kosdaq_change,
-            'marketStatus': 'live',
+            'marketStatus': market_status,
             'kospiAbove200': kospi_above200,
         }
     except Exception as e:
-        logger.error(f'지수 조회 오류: {e}')
+        logger.error(f'pykrx 지수 조회 실패: {e}')
+
+    # ── 2차 시도: yfinance 폴백 ──────────────────────
+    try:
+        import yfinance as yf
+        ki_hist = yf.Ticker('^KS11').history(period='60d')
+        kq_hist = yf.Ticker('^KQ11').history(period='5d')
+
+        if ki_hist is not None and len(ki_hist) >= 2:
+            kospi_price  = float(ki_hist['Close'].iloc[-1])
+            kospi_prev   = float(ki_hist['Close'].iloc[-2])
+            kospi_change = round((kospi_price - kospi_prev) / kospi_prev * 100, 2) if kospi_prev > 0 else 0.0
+            kospi_ma200  = float(ki_hist['Close'].iloc[-200:].mean()) if len(ki_hist) >= 200 else float(ki_hist['Close'].mean())
+            kospi_above200 = bool(kospi_price > kospi_ma200)
+        else:
+            kospi_price, kospi_change, kospi_above200 = 0.0, 0.0, True
+
+        if kq_hist is not None and len(kq_hist) >= 2:
+            kosdaq_price  = float(kq_hist['Close'].iloc[-1])
+            kosdaq_prev   = float(kq_hist['Close'].iloc[-2])
+            kosdaq_change = round((kosdaq_price - kosdaq_prev) / kosdaq_prev * 100, 2) if kosdaq_prev > 0 else 0.0
+        else:
+            kosdaq_price, kosdaq_change = 0.0, 0.0
+
+        logger.info(f'yfinance 폴백 지수: KOSPI={kospi_price} KOSDAQ={kosdaq_price}')
         return {
-            'kospi': 0, 'kospiChange': 0,
-            'kosdaq': 0, 'kosdaqChange': 0,
-            'marketStatus': 'closed', 'kospiAbove200': True,
+            'kospi': round(kospi_price, 2),
+            'kospiChange': kospi_change,
+            'kosdaq': round(kosdaq_price, 2),
+            'kosdaqChange': kosdaq_change,
+            'marketStatus': market_status,
+            'kospiAbove200': kospi_above200,
         }
+    except Exception as e:
+        logger.error(f'yfinance 지수 조회 실패: {e}')
+
+    # ── 최종 폴백: 지수는 0이지만 시장 상태는 KST 기준 ──
+    return {
+        'kospi': 0, 'kospiChange': 0,
+        'kosdaq': 0, 'kosdaqChange': 0,
+        'marketStatus': market_status,
+        'kospiAbove200': True,
+    }
 
 
 # ─────────────────────────────────────────
@@ -356,12 +422,13 @@ def run_scan():
     empty_sectors = [{'name': n, 'netBuy': 0, 'change': 0, 'trend': 'neutral'} for n, _ in SECTOR_INDEX_MAP]
 
     # 1. 전종목 OHLCV (당일)
-    logger.info('KOSPI/KOSDAQ 전종목 조회...')
+    logger.info(f'KOSPI/KOSDAQ 전종목 조회... (기준일: {date_str})')
     try:
         kospi_ohlcv  = krx.get_market_ohlcv_by_ticker(date_str, market='KOSPI')
         kosdaq_ohlcv = krx.get_market_ohlcv_by_ticker(date_str, market='KOSDAQ')
+        logger.info(f'KOSPI {len(kospi_ohlcv) if kospi_ohlcv is not None else 0}개, KOSDAQ {len(kosdaq_ohlcv) if kosdaq_ohlcv is not None else 0}개')
     except Exception as e:
-        logger.error(f'전종목 OHLCV 오류: {e}')
+        logger.error(f'전종목 OHLCV 오류 (pykrx 실패): {type(e).__name__}: {e}')
         return {'stocks': [], 'market': get_market_indices(date_str), 'sectors': empty_sectors}
 
     # 2. 시가총액 / 상장주식수
@@ -425,12 +492,17 @@ def run_scan():
     all_df['_per']    = pd.to_numeric(all_df[per_col],   errors='coerce').fillna(0) if per_col   else 0
     all_df['_pbr']    = pd.to_numeric(all_df[pbr_col],   errors='coerce').fillna(0) if pbr_col   else 0
 
-    # 7. 필터: 가격 ≥ 1,000원, 시총 ≥ 500억
-    filtered = all_df[
-        (all_df['_close'] >= 1_000) &
-        (all_df['_cap']   >= 50_000_000_000)
-    ].copy()
-    logger.info(f'기본 필터 후: {len(filtered)}개')
+    # 7. 필터: 가격 ≥ 1,000원, 시총 ≥ 500억 (시총 데이터 없으면 가격 필터만)
+    has_cap_data = cap_col is not None and all_df['_cap'].sum() > 0
+    if has_cap_data:
+        filtered = all_df[
+            (all_df['_close'] >= 1_000) &
+            (all_df['_cap']   >= 50_000_000_000)
+        ].copy()
+    else:
+        logger.warning('시총 데이터 없음 → 가격 필터만 적용')
+        filtered = all_df[all_df['_close'] >= 1_000].copy()
+    logger.info(f'기본 필터 후: {len(filtered)}개 (시총데이터={has_cap_data})')
 
     # 거래량 TOP 50
     filtered = filtered.sort_values('_vol', ascending=False).head(50)
