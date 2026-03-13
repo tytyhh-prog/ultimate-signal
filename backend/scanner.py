@@ -10,6 +10,8 @@ import concurrent.futures
 import logging
 import time
 import pytz
+import requests
+import io
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,106 @@ def get_col(df, candidates, fallback_idx=None):
 # ─────────────────────────────────────────
 # 투자자별 수급 데이터 조회 (pykrx)
 # ─────────────────────────────────────────
+
+def get_investor_data_direct(ticker, date_str):
+    """
+    KRX 데이터 포털 직접 HTTP 호출 — CP949 명시로 pykrx 인코딩 오류 우회
+    pykrx 내부에서 'utf-8' 디코딩 실패 시 이 함수로 폴백
+    """
+    _KRX_OTP  = 'http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd'
+    _KRX_CSV  = 'http://data.krx.co.kr/comm/fileDn/download_csv.cmd'
+    _HEADERS  = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer':    'http://data.krx.co.kr/',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    }
+
+    start_str = (datetime.today() - timedelta(days=10)).strftime('%Y%m%d')
+
+    # KRX는 6자리 ticker를 isuCd로 직접 수락하는 경우도 있으나
+    # 정규 format은 'KR7{ticker}003' (보통주 기준)
+    isu_candidates = [ticker, f'KR7{ticker}003']
+
+    for isu_cd in isu_candidates:
+        try:
+            sess = requests.Session()
+
+            # ── OTP 획득 ──────────────────────────────────────────────
+            otp_payload = {
+                'searchType': '1',
+                'mktId':      'ALL',
+                'strtDd':     start_str,
+                'endDd':      date_str,
+                'isuCd':      isu_cd,
+                'share':      '1',
+                'money':      '1',
+                'csvxls_isNo': 'false',
+                'name':       'fileDown',
+                'url':        'dbms/MDC/STAT/standard/MDCSTAT02302',
+            }
+            r_otp = sess.post(_KRX_OTP, data=otp_payload, headers=_HEADERS, timeout=15)
+            otp_code = r_otp.text.strip()
+
+            if not otp_code or len(otp_code) > 200 or not otp_code.isalnum():
+                logger.warning(f'[{ticker}] KRX direct OTP 획득 실패 (isuCd={isu_cd}): "{otp_code[:50]}"')
+                continue
+
+            # ── CSV 다운로드 (CP949 명시) ───────────────────────────
+            r_csv = sess.post(_KRX_CSV, data={'code': otp_code}, headers=_HEADERS, timeout=15)
+            r_csv.encoding = 'cp949'
+
+            df = pd.read_csv(io.StringIO(r_csv.text))
+            if df is None or len(df) == 0:
+                logger.warning(f'[{ticker}] KRX direct CSV 빈 응답 (isuCd={isu_cd})')
+                continue
+
+            logger.info(f'[{ticker}] KRX direct 성공 (isuCd={isu_cd}) columns: {list(df.columns)}')
+            logger.info(f'[{ticker}] KRX direct 최근 데이터:\n{df.tail(2).to_string()}')
+
+            # ── 컬럼 탐색 ──────────────────────────────────────────
+            inst_col    = get_col(df, ['기관합계', '기관계', '기관'],              fallback_idx=None)
+            foreign_col = get_col(df, ['외국인합계', '외국인계', '외국인', '기타법인'], fallback_idx=None)
+            retail_col  = get_col(df, ['개인'],                                    fallback_idx=None)
+
+            if inst_col is None and foreign_col is None:
+                logger.warning(f'[{ticker}] KRX direct 컬럼 탐색 실패: {list(df.columns)}')
+                continue
+
+            latest          = df.iloc[-1]
+            inst_raw_won    = safe_float(latest[inst_col])    if inst_col    else None
+            foreign_raw_won = safe_float(latest[foreign_col]) if foreign_col else None
+            retail_raw_won  = safe_float(latest[retail_col])  if retail_col  else None
+
+            inst_net    = round(inst_raw_won    / 100_000_000, 1) if inst_raw_won    is not None else None
+            foreign_net = round(foreign_raw_won / 100_000_000, 1) if foreign_raw_won is not None else None
+            retail_net  = round(retail_raw_won  / 100_000_000, 1) if retail_raw_won  is not None else None
+
+            logger.info(f'[{ticker}] KRX direct 수급: 기관={inst_net}억, 외국인={foreign_net}억, 개인={retail_net}억')
+
+            both_zero = (inst_net is not None and inst_net == 0) and \
+                        (foreign_net is not None and foreign_net == 0)
+
+            return {
+                'instNetBuy':             inst_net,
+                'foreignNetBuy':          foreign_net,
+                'retailNetBuy':           retail_net,
+                'instRawWon':             inst_raw_won,
+                'foreignRawWon':          foreign_raw_won,
+                'instConsecutiveDays':    0,
+                'foreignConsecutiveDays': 0,
+                'supplyDataAvailable':    True,
+                'supplySource':           'live' if is_market_open() else 'closing',
+                'supplyFailReason':       f'기관+외국인 모두 0억 (원: {inst_raw_won}/{foreign_raw_won})' if both_zero else None,
+                'columns':                list(df.columns),
+            }
+
+        except Exception as e:
+            logger.warning(f'[{ticker}] KRX direct 오류 (isuCd={isu_cd}): {type(e).__name__}: {e}')
+            continue
+
+    logger.error(f'[{ticker}] KRX direct 모든 시도 실패')
+    return None
+
 
 def get_investor_data(ticker, date_str):
     """
@@ -218,6 +320,28 @@ def get_investor_data(ticker, date_str):
             _supply_cache[ticker] = result.copy()
 
         return result
+
+    except UnicodeDecodeError as e:
+        # KRX 응답이 CP949인데 pykrx가 UTF-8로 읽으려다 실패
+        # → KRX API 직접 호출 (CP949 명시) 로 폴백
+        reason_pykrx = f'pykrx UnicodeDecodeError (CP949/UTF-8 인코딩 불일치): {e}'
+        logger.warning(f'[{ticker}] {reason_pykrx} → KRX direct 폴백 시도')
+
+        direct = get_investor_data_direct(ticker, date_str)
+        if direct:
+            logger.info(f'[{ticker}] KRX direct 폴백 성공')
+            if direct.get('instNetBuy') is not None or direct.get('foreignNetBuy') is not None:
+                _supply_cache[ticker] = direct.copy()
+            return direct
+
+        # KRX direct도 실패 → 캐시 또는 None
+        if ticker in _supply_cache:
+            cached = _supply_cache[ticker].copy()
+            cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
+                            'supplyFailReason': f'pykrx 인코딩 오류 + KRX direct 실패 → 캐시 사용'})
+            return cached
+        return {'supplyDataAvailable': False, 'supplySource': 'none',
+                'supplyFailReason': reason_pykrx, 'columns': []}
 
     except Exception as e:
         reason = f'{type(e).__name__}: {e}'
