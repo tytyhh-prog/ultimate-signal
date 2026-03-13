@@ -134,10 +134,18 @@ const useStore = create((set, get) => ({
                 console.log(`[runScan] ${s.name} 수급: 기관 ${s.instNetBuy}억, 외국인 ${s.foreignNetBuy}억, 개인 ${s.retailNetBuy}억, 거래량 ${s.volume?.toLocaleString()}`);
             });
 
-            // 점수 ≥ 60 우선, 없으면 상위 5개 반환
+            // 등급 우선순위 필터
+            // 1순위: 점수 ≥ 60 (WATCH 이상)
+            // 2순위: UNCONFIRMED (수급 미확인이지만 기법+퀀트 통과)
+            // 3순위: 점수 기준 상위 5개
             const sorted = scored.sort((a, b) => b.ultimate.scaledScore - a.ultimate.scaledScore);
             const above60 = sorted.filter(r => r.ultimate.scaledScore >= 60);
-            const results = (above60.length > 0 ? above60 : sorted).slice(0, 5);
+            const unconfirmed = sorted.filter(r => r.ultimate.grade === 'UNCONFIRMED');
+            const results = above60.length > 0
+                ? above60.slice(0, 5)
+                : unconfirmed.length > 0
+                    ? unconfirmed.slice(0, 5)
+                    : sorted.slice(0, 5);
             console.log(`[runScan] 최종 반환: ${results.length}개`);
 
             set({ step: 'AI 분석 생성 중...', progress: 92 });

@@ -2,15 +2,37 @@ import React, { useState } from 'react';
 import ScoreBar from './ScoreBar';
 
 const gradeStyles = {
-    DIAMOND: { bg: 'bg-[#b9f2ff]/10', border: 'border-[#b9f2ff]/30', text: 'text-[#b9f2ff]', glow: 'animate-diamond-pulse' },
-    FIRE: { bg: 'bg-[#ff6b35]/10', border: 'border-[#ff6b35]/30', text: 'text-[#ff6b35]', glow: 'glow-fire' },
-    BUY: { bg: 'bg-[#00e676]/10', border: 'border-[#00e676]/30', text: 'text-[#00e676]', glow: 'glow-buy' },
-    WATCH: { bg: 'bg-[#ffd600]/10', border: 'border-[#ffd600]/30', text: 'text-[#ffd600]', glow: '' },
+    DIAMOND:     { bg: 'bg-[#b9f2ff]/10', border: 'border-[#b9f2ff]/30', text: 'text-[#b9f2ff]',  glow: 'animate-diamond-pulse' },
+    FIRE:        { bg: 'bg-[#ff6b35]/10', border: 'border-[#ff6b35]/30', text: 'text-[#ff6b35]',  glow: 'glow-fire' },
+    BUY:         { bg: 'bg-[#00e676]/10', border: 'border-[#00e676]/30', text: 'text-[#00e676]',  glow: 'glow-buy' },
+    WATCH:       { bg: 'bg-[#ffd600]/10', border: 'border-[#ffd600]/30', text: 'text-[#ffd600]',  glow: '' },
+    UNCONFIRMED: { bg: 'bg-[#ab47bc]/10', border: 'border-[#ab47bc]/30', text: 'text-[#ab47bc]',  glow: '' },
+    EXCLUDE:     { bg: 'bg-[#78909c]/10', border: 'border-[#78909c]/30', text: 'text-[#78909c]',  glow: '' },
 };
+
+/**
+ * 수급 값 표시: null → "N/A", 숫자 → "+12억" / "-5억" / "0억"
+ */
+function formatSupply(val) {
+    if (val === null || val === undefined) return { text: 'N/A', colorClass: 'text-[var(--color-text-muted)]' };
+    const prefix = val >= 0 ? '+' : '';
+    const colorClass = val > 0 ? 'text-[var(--color-up)]' : val < 0 ? 'text-[var(--color-down)]' : 'text-[var(--color-text-secondary)]';
+    return { text: `${prefix}${val}억`, colorClass };
+}
 
 export default function SignalCard({ signal, index }) {
     const [expanded, setExpanded] = useState(false);
     const s = gradeStyles[signal.ultimate.grade] || gradeStyles.WATCH;
+
+    const instDisplay = formatSupply(signal.instNetBuy);
+    const foreignDisplay = formatSupply(signal.foreignNetBuy);
+    const retailDisplay = formatSupply(signal.retailNetBuy);
+
+    // 수급 데이터 소스 라벨
+    const supplySourceLabel = signal.supplySource === 'live' ? '🟢 실시간'
+        : signal.supplySource === 'closing' ? '🟡 장마감 기준'
+            : signal.supplySource === 'cache' ? '🟠 캐시'
+                : '⚪ N/A';
 
     return (
         <div
@@ -23,7 +45,7 @@ export default function SignalCard({ signal, index }) {
                     <div>
                         <div className="flex items-center gap-2 flex-wrap">
                             <span className={`text-sm font-bold px-2.5 py-0.5 rounded-full ${s.bg} ${s.text} border ${s.border}`}>
-                                {signal.ultimate.gradeEmoji} {signal.ultimate.grade}
+                                {signal.ultimate.gradeEmoji} {signal.ultimate.grade === 'UNCONFIRMED' ? '수급미확인' : signal.ultimate.grade}
                             </span>
                             <h3 className="text-lg sm:text-xl font-bold text-[var(--color-text-primary)]">
                                 {signal.name}
@@ -33,6 +55,15 @@ export default function SignalCard({ signal, index }) {
                         <div className="mt-1 text-sm text-[var(--color-text-secondary)]">
                             ULTIMATE 점수: <span className="font-bold text-[var(--color-text-primary)] font-mono">{signal.ultimate.scaledScore}</span>
                             <span className="text-[var(--color-text-muted)]"> / 140</span>
+                            {signal.ultimate.supplyStatus === 'missing' && (
+                                <span className="ml-2 text-xs text-yellow-500">⚠️ 수급 API 미수신</span>
+                            )}
+                            {signal.ultimate.supplyStatus === 'neutral' && (
+                                <span className="ml-2 text-xs text-orange-400">⚠️ 수급 중립 (0억)</span>
+                            )}
+                            {signal.ultimate.supplyStatus === 'negative' && (
+                                <span className="ml-2 text-xs text-red-400">🔴 수급 매도세</span>
+                            )}
                         </div>
                     </div>
                     <div className="text-right shrink-0">
@@ -47,6 +78,18 @@ export default function SignalCard({ signal, index }) {
                         </div>
                     </div>
                 </div>
+
+                {/* EXCLUDE 사유 표시 */}
+                {signal.ultimate.grade === 'EXCLUDE' && signal.ultimate.excludeReasons?.length > 0 && (
+                    <div className="mb-4 bg-[#78909c]/10 border border-[#78909c]/20 rounded-lg p-3">
+                        <div className="text-xs font-semibold text-[#78909c] mb-1.5">❌ EXCLUDE 사유</div>
+                        <ul className="space-y-0.5">
+                            {signal.ultimate.excludeReasons.map((reason, i) => (
+                                <li key={i} className="text-xs text-[var(--color-text-secondary)]">• {reason}</li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
 
                 {/* 3-Layer Score Bars */}
                 <div className="space-y-3 mb-5">
@@ -64,16 +107,11 @@ export default function SignalCard({ signal, index }) {
                             badge={`${signal.supplyPattern.emoji}${signal.supplyPattern.pattern}`}
                             delay={index * 150}
                         />
-                        <div className="flex gap-3 mt-1 text-xs text-[var(--color-text-secondary)] ml-7 font-mono">
-                            <span>기관 <span className={signal.instNetBuy >= 0 ? 'text-[var(--color-up)]' : 'text-[var(--color-down)]'}>
-                                {signal.instNetBuy >= 0 ? '+' : ''}{signal.instNetBuy}억
-                            </span></span>
-                            <span>외국인 <span className={signal.foreignNetBuy >= 0 ? 'text-[var(--color-up)]' : 'text-[var(--color-down)]'}>
-                                {signal.foreignNetBuy >= 0 ? '+' : ''}{signal.foreignNetBuy}억
-                            </span></span>
-                            <span>개인 <span className={signal.retailNetBuy >= 0 ? 'text-[var(--color-up)]' : 'text-[var(--color-down)]'}>
-                                {signal.retailNetBuy >= 0 ? '+' : ''}{signal.retailNetBuy}억
-                            </span></span>
+                        <div className="flex gap-3 mt-1 text-xs text-[var(--color-text-secondary)] ml-7 font-mono flex-wrap">
+                            <span>기관 <span className={instDisplay.colorClass}>{instDisplay.text}</span></span>
+                            <span>외국인 <span className={foreignDisplay.colorClass}>{foreignDisplay.text}</span></span>
+                            <span>개인 <span className={retailDisplay.colorClass}>{retailDisplay.text}</span></span>
+                            <span className="text-[10px] opacity-60">{supplySourceLabel}</span>
                         </div>
                     </div>
 
