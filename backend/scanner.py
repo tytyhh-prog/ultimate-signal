@@ -360,8 +360,10 @@ def get_investor_data(ticker, date_str):
     except UnicodeDecodeError as e:
         # KRX 응답이 CP949인데 pykrx가 UTF-8로 읽으려다 실패
         # → KRX API 직접 호출 (CP949 명시) 로 폴백
+        import traceback
         reason_pykrx = f'pykrx UnicodeDecodeError (CP949/UTF-8 인코딩 불일치): {e}'
         logger.warning(f'[{ticker}] {reason_pykrx} → KRX direct 폴백 시도')
+        logger.warning(f'[{ticker}] 전체 스택트레이스:\n{traceback.format_exc()}')
 
         direct = get_investor_data_direct(ticker, date_str)
         if direct:
