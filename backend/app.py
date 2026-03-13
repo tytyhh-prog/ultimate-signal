@@ -26,7 +26,7 @@ def health_root():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'status': 'ok', 'version': 'v7-timeout'})
+    return jsonify({'ok': True, 'status': 'ok', 'version': 'v7b-sync'})
 
 
 @app.route('/api/market', methods=['GET'])
@@ -96,34 +96,28 @@ def debug_last_error():
 
 @app.route('/api/debug/trigger_supply/<ticker>', methods=['GET'])
 def debug_trigger_supply(ticker):
-    """수급 조회를 백그라운드로 트리거 (30초 후 /api/debug/last_error로 확인)"""
-    import threading, time
-    result_holder = {}
-    def _run():
-        try:
-            t0 = time.time()
-            date_str = scanner.get_last_trading_date()
-            result = scanner.get_investor_data(ticker, date_str)
-            elapsed = round(time.time() - t0, 2)
-            scanner._last_supply_error.update({
-                'tb': None,
-                'ticker': ticker,
-                'error': None,
-                'result': result,
-                'elapsed_sec': elapsed,
-            })
-        except Exception as e:
-            import traceback
-            scanner._last_supply_error.update({
-                'tb': traceback.format_exc(),
-                'ticker': ticker,
-                'error': f'{type(e).__name__}: {e}',
-                'result': None,
-                'elapsed_sec': None,
-            })
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return jsonify({'triggered': ticker, 'hint': 'Wait ~45s, then GET /api/debug/last_error'})
+    """수급 조회 동기 실행 — 결과 직접 반환 (최대 20초 대기)"""
+    import time, traceback as tb
+    t0 = time.time()
+    try:
+        date_str = scanner.get_last_trading_date()
+        result = scanner.get_investor_data(ticker, date_str)
+        elapsed = round(time.time() - t0, 2)
+        return jsonify({
+            'ticker': ticker,
+            'elapsed_sec': elapsed,
+            'result': result,
+            'error': None,
+        })
+    except Exception as e:
+        elapsed = round(time.time() - t0, 2)
+        return jsonify({
+            'ticker': ticker,
+            'elapsed_sec': elapsed,
+            'result': None,
+            'error': f'{type(e).__name__}: {e}',
+            'traceback': tb.format_exc(),
+        })
 
 
 @app.route('/api/debug/krx_raw', methods=['GET'])
