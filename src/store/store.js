@@ -129,9 +129,16 @@ const useStore = create((set, get) => ({
             console.log(`[runScan] 수집된 종목: ${scored.length}개`);
             console.log('[runScan] 점수 분포:', scored.map(s => `${s.name}:${s.ultimate.scaledScore}`).join(', '));
 
-            // 수급 데이터 상세 로그
+            // 수급 데이터 상세 로그 (status/reason 포함)
             scored.forEach(s => {
-                console.log(`[runScan] ${s.name} 수급: 기관 ${s.instNetBuy}억, 외국인 ${s.foreignNetBuy}억, 개인 ${s.retailNetBuy}억, 거래량 ${s.volume?.toLocaleString()}`);
+                const sr = s.supplyResult;
+                console.log(
+                    `[runScan] ${s.name}(${s.ticker}) 수급: ` +
+                    `기관=${s.instNetBuy}억(원:${s.instRawWon}), 외국인=${s.foreignNetBuy}억(원:${s.foreignRawWon}), ` +
+                    `status=${sr?.supplyStatus}, source=${s.supplySource}, ` +
+                    `reason="${s.supplyFailReason || sr?.supplyReason || '-'}", ` +
+                    `columns=${JSON.stringify(s.supplyColumns || [])}`
+                );
             });
 
             // 등급 우선순위 필터

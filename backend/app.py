@@ -61,6 +61,33 @@ def scan():
         }), 500
 
 
+@app.route('/api/debug/supply/<ticker>', methods=['GET'])
+def debug_supply(ticker):
+    """특정 종목 수급 raw 데이터 진단 (예: /api/debug/supply/105560)"""
+    try:
+        date_str = scanner.get_last_trading_date()
+        result = scanner.get_investor_data(ticker, date_str)
+        return jsonify({
+            'ticker': ticker,
+            'date': date_str,
+            'market_open': scanner.is_market_open(),
+            'supply_result': result,
+            'diagnosis': {
+                'data_available': bool(result and result.get('supplyDataAvailable')),
+                'source': result.get('supplySource') if result else 'none',
+                'fail_reason': result.get('supplyFailReason') if result else 'get_investor_data returned None',
+                'columns': result.get('columns', []) if result else [],
+                'inst_net_billion': result.get('instNetBuy') if result else None,
+                'foreign_net_billion': result.get('foreignNetBuy') if result else None,
+                'inst_raw_won': result.get('instRawWon') if result else None,
+                'foreign_raw_won': result.get('foreignRawWon') if result else None,
+            }
+        })
+    except Exception as e:
+        logger.error(f'[debug/supply/{ticker}] 오류: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/debug/yf', methods=['GET'])
 def debug_yf():
     """yfinance 한국 종목 동작 여부 진단"""

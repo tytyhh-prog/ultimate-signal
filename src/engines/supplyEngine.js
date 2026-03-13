@@ -12,20 +12,57 @@ function safeNum(val) {
 
 /**
  * 수급 상태 분류
- * 'active'   — 기관/외국인 실제 매수 존재
+ * 'active'   — 기관/외국인 실제 매수 존재 (> 0)
  * 'neutral'  — 데이터 있으나 매수 없음 (0 또는 소폭 매도)
  * 'negative' — 기관+외국인 동시 순매도
- * 'missing'  — API 미수신 (null)
+ * 'missing'  — API 미수신 (null/undefined)
  */
 function classifySupplyStatus(instNetBuy, foreignNetBuy, supplyDataAvailable, score, rawScore) {
+    // null = API 미수신 / undefined = 필드 자체 없음 → missing
     if (!supplyDataAvailable) return 'missing';
+    if (instNetBuy === null && foreignNetBuy === null) return 'missing';
+
     const hasAnyBuying = (instNetBuy !== null && instNetBuy > 0) ||
                          (foreignNetBuy !== null && foreignNetBuy > 0);
     if (hasAnyBuying || score > 0) return 'active';
+
     const bothNegative = (instNetBuy !== null && instNetBuy < 0) &&
                          (foreignNetBuy !== null && foreignNetBuy < 0);
     if (bothNegative || rawScore < -10) return 'negative';
     return 'neutral';
+}
+
+/**
+ * 수급 미확인 사유 상세 텍스트 생성
+ */
+function buildSupplyReason(stock, instNetBuy, foreignNetBuy, supplyStatus) {
+    if (supplyStatus === 'missing') {
+        if (stock.supplyFailReason) return `API 실패: ${stock.supplyFailReason}`;
+        if (stock.supplySource === 'none') return '수급 API 미수신 (응답 없음)';
+        if (stock.supplySource === 'cache') return '수급 캐시 사용 (최신 데이터 없음)';
+        return '수급 데이터 없음 (null)';
+    }
+    if (supplyStatus === 'neutral') {
+        const instRaw = stock.instRawWon;
+        const foreignRaw = stock.foreignRawWon;
+        const parts = [];
+        if (instNetBuy === 0 && instRaw !== null && instRaw !== undefined) {
+            parts.push(`기관 ${instRaw.toLocaleString()}원 (0억 미만)`);
+        } else if (instNetBuy === null) {
+            parts.push('기관 데이터 없음');
+        } else if (instNetBuy <= 0) {
+            parts.push(`기관 ${instNetBuy}억 (매도/중립)`);
+        }
+        if (foreignNetBuy === 0 && foreignRaw !== null && foreignRaw !== undefined) {
+            parts.push(`외국인 ${foreignRaw.toLocaleString()}원 (0억 미만)`);
+        } else if (foreignNetBuy === null) {
+            parts.push('외국인 데이터 없음');
+        } else if (foreignNetBuy <= 0) {
+            parts.push(`외국인 ${foreignNetBuy}억 (매도/중립)`);
+        }
+        return parts.length > 0 ? parts.join(' / ') : '기관+외국인 순매수 없음';
+    }
+    return null;
 }
 
 export function calculateSupplyScore(stock) {
@@ -46,11 +83,15 @@ export function calculateSupplyScore(stock) {
     const supplyDataAvailable = stock.supplyDataAvailable !== false &&
         (instNetBuy !== null || foreignNetBuy !== null);
 
-    if (!supplyDataAvailable) {
-        // API 미수신 — null로 전달됨
-        const reason = stock.supplySource === 'none'
-            ? '수급 API 미수신 (요청 실패)'
-            : '수급 데이터 없음 (N/A)';
+    if (!supplyDataAvailable || (instNetBuy === null && foreignNetBuy === null)) {
+        // API 미수신 또는 null 응답
+        const failReason = stock.supplyFailReason || null;
+        const src = stock.supplySource || 'none';
+        let reason;
+        if (failReason)               reason = `API 실패: ${failReason}`;
+        else if (src === 'cache')     reason = '수급 캐시 사용 (최신 없음)';
+        else if (src === 'none')      reason = '수급 API 미수신';
+        else                          reason = '수급 데이터 없음 (N/A)';
         details.push(`⚠️ ${reason}`);
         return {
             score: 0,
@@ -58,6 +99,7 @@ export function calculateSupplyScore(stock) {
             details,
             supplyDataAvailable: false,
             supplyStatus: 'missing',
+            supplyReason: reason,
             instNetBuy,
             foreignNetBuy,
         };
@@ -179,15 +221,11 @@ export function calculateSupplyScore(stock) {
 
     // 수급 상태 분류
     const supplyStatus = classifySupplyStatus(instNetBuy, foreignNetBuy, supplyDataAvailable, score, rawScore);
+    const supplyReason = buildSupplyReason(stock, instNetBuy, foreignNetBuy, supplyStatus);
 
     // neutral/negative 상태에서 사유 상세화
     if (supplyStatus === 'neutral') {
-        if (instNetBuy === 0 && foreignNetBuy === 0) {
-            details.push('⚠️ 기관+외국인 순매수 없음 (0억)');
-        } else {
-            if (instNetBuy !== null && instNetBuy <= 0) details.push(`⚠️ 기관 순매도/중립 (${instNetBuy}억)`);
-            if (foreignNetBuy !== null && foreignNetBuy <= 0) details.push(`⚠️ 외국인 순매도/중립 (${foreignNetBuy}억)`);
-        }
+        details.push(`⚠️ ${supplyReason || '기관+외국인 순매수 없음'}`);
     } else if (supplyStatus === 'negative') {
         details.push('🔴 기관+외국인 동시 순매도');
     }
@@ -198,6 +236,7 @@ export function calculateSupplyScore(stock) {
         details,
         supplyDataAvailable: true,
         supplyStatus,
+        supplyReason,
         instNetBuy,
         foreignNetBuy,
     };

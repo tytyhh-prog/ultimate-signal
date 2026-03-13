@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 _cache = {'data': None, 'timestamp': 0}
 CACHE_TTL = 300
 
+# 마지막 유효 수급 데이터 캐시 (장외에서 사용)
+_supply_cache = {}
+
 # KOSPI 업종 지수 코드 매핑
 SECTOR_INDEX_MAP = [
     ('2차전지/전기차', '1008'),
@@ -108,6 +111,127 @@ def get_col(df, candidates, fallback_idx=None):
 
 
 # ─────────────────────────────────────────
+# 투자자별 수급 데이터 조회 (pykrx)
+# ─────────────────────────────────────────
+
+def get_investor_data(ticker, date_str):
+    """
+    종목별 기관/외국인/개인 순매수 데이터 조회
+    반환 필드:
+      instNetBuy / foreignNetBuy / retailNetBuy  — 억원 (소수점 1자리)
+      instRawWon / foreignRawWon                 — 원 단위 실제값 (디버그용)
+      supplyDataAvailable                        — True/False
+      supplySource                               — live/closing/cache/none
+      supplyFailReason                           — 실패 시 구체 이유
+      columns                                    — pykrx 응답 컬럼 목록
+    """
+    global _supply_cache
+    try:
+        start = (datetime.today() - timedelta(days=10)).strftime('%Y%m%d')
+        df = krx.get_market_trading_value_by_date(start, date_str, ticker)
+
+        if df is None or len(df) == 0:
+            reason = f'pykrx 빈 DataFrame (start={start}, date={date_str})'
+            logger.warning(f'[{ticker}] 수급 데이터 없음 — {reason}')
+            if ticker in _supply_cache:
+                cached = _supply_cache[ticker].copy()
+                cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
+                                'supplyFailReason': '빈 DataFrame → 캐시 사용'})
+                return cached
+            return {'supplyDataAvailable': False, 'supplySource': 'none',
+                    'supplyFailReason': reason, 'columns': []}
+
+        cols = list(df.columns)
+        logger.info(f'[{ticker}] 수급 raw columns: {cols}')
+        logger.info(f'[{ticker}] 수급 raw data (최근):\n{df.tail(3).to_string()}')
+
+        # 컬럼명 탐색 (pykrx 버전별 차이 대응)
+        inst_col    = get_col(df, ['기관합계', '기관계', '기관'],              fallback_idx=None)
+        foreign_col = get_col(df, ['외국인합계', '외국인계', '외국인', '기타법인'], fallback_idx=None)
+        retail_col  = get_col(df, ['개인'],                                    fallback_idx=None)
+
+        if inst_col is None and foreign_col is None:
+            reason = f'필요 컬럼 없음 — 실제 컬럼: {cols}'
+            logger.warning(f'[{ticker}] 수급 컬럼 탐색 실패 — {reason}')
+            if ticker in _supply_cache:
+                cached = _supply_cache[ticker].copy()
+                cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
+                                'supplyFailReason': reason, 'columns': cols})
+                return cached
+            return {'supplyDataAvailable': False, 'supplySource': 'none',
+                    'supplyFailReason': reason, 'columns': cols}
+
+        # 최근 거래일 원 단위 실제값 보존
+        latest = df.iloc[-1]
+        inst_raw_won    = safe_float(latest[inst_col])    if inst_col    else None
+        foreign_raw_won = safe_float(latest[foreign_col]) if foreign_col else None
+        retail_raw_won  = safe_float(latest[retail_col])  if retail_col  else None
+
+        # 억원 단위 환산 — 소수점 1자리 유지 (0.3억 등 작은 값 보존)
+        inst_net    = round(inst_raw_won    / 100_000_000, 1) if inst_raw_won    is not None else None
+        foreign_net = round(foreign_raw_won / 100_000_000, 1) if foreign_raw_won is not None else None
+        retail_net  = round(retail_raw_won  / 100_000_000, 1) if retail_raw_won  is not None else None
+
+        logger.info(f'[{ticker}] 수급 파싱 결과: 기관={inst_net}억(원:{inst_raw_won}), '
+                    f'외국인={foreign_net}억(원:{foreign_raw_won}), 개인={retail_net}억')
+
+        # 연속 매수일 계산
+        inst_consecutive = 0
+        foreign_consecutive = 0
+        if inst_col and len(df) >= 2:
+            for i in range(len(df) - 1, -1, -1):
+                if safe_float(df.iloc[i][inst_col]) > 0:
+                    inst_consecutive += 1
+                else:
+                    break
+        if foreign_col and len(df) >= 2:
+            for i in range(len(df) - 1, -1, -1):
+                if safe_float(df.iloc[i][foreign_col]) > 0:
+                    foreign_consecutive += 1
+                else:
+                    break
+
+        # 수급 상태 판정 — 0 vs None 구분
+        both_zero = (inst_net is not None and inst_net == 0) and \
+                    (foreign_net is not None and foreign_net == 0)
+        fail_reason = None
+        if both_zero:
+            fail_reason = f'기관+외국인 모두 0억 (원단위: 기관={inst_raw_won}, 외국인={foreign_raw_won})'
+            logger.info(f'[{ticker}] 수급 0 확인: {fail_reason}')
+
+        result = {
+            'instNetBuy':             inst_net,
+            'foreignNetBuy':          foreign_net,
+            'retailNetBuy':           retail_net,
+            'instRawWon':             inst_raw_won,
+            'foreignRawWon':          foreign_raw_won,
+            'instConsecutiveDays':    inst_consecutive,
+            'foreignConsecutiveDays': foreign_consecutive,
+            'supplyDataAvailable':    True,
+            'supplySource':           'live' if is_market_open() else 'closing',
+            'supplyFailReason':       fail_reason,
+            'columns':                cols,
+        }
+
+        # 유효 캐시 갱신 (실제 데이터 있을 때만)
+        if inst_net is not None or foreign_net is not None:
+            _supply_cache[ticker] = result.copy()
+
+        return result
+
+    except Exception as e:
+        reason = f'{type(e).__name__}: {e}'
+        logger.error(f'[{ticker}] 수급 조회 예외 — {reason}')
+        if ticker in _supply_cache:
+            cached = _supply_cache[ticker].copy()
+            cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
+                            'supplyFailReason': f'예외 발생 → 캐시 사용 ({reason})'})
+            return cached
+        return {'supplyDataAvailable': False, 'supplySource': 'none',
+                'supplyFailReason': reason, 'columns': []}
+
+
+# ─────────────────────────────────────────
 # 마지막 거래일 탐지
 # ─────────────────────────────────────────
 
@@ -129,8 +253,9 @@ def get_last_trading_date():
 # ─────────────────────────────────────────
 
 def _build_stock_dict(ticker, name, price, volume, market_cap, per, pbr,
-                      close, vol_series, change=0.0, shares=0):
-    """공통 종목 dict 생성"""
+                      close, vol_series, change=0.0, shares=0,
+                      supply_data=None):
+    """공통 종목 dict 생성 (supply_data: 수급 데이터 dict 또는 None)"""
     ma50  = round(calc_ma(close, 50))
     ma150 = round(calc_ma(close, 150))
     ma200 = round(calc_ma(close, 200))
@@ -197,13 +322,30 @@ def _build_stock_dict(ticker, name, price, volume, market_cap, per, pbr,
         else ('up' if ma200_trend == 'up' else 'down')
     )
 
+    # 수급 데이터: 실제 값 사용, 없으면 None (0 ≠ None)
+    sd = supply_data or {}
+    inst_net    = sd.get('instNetBuy')      # None = 데이터 없음, 0.0 = 실제 0
+    foreign_net = sd.get('foreignNetBuy')
+    retail_net  = sd.get('retailNetBuy')
+    supply_available  = sd.get('supplyDataAvailable', False)
+    supply_source     = sd.get('supplySource', 'none')
+    supply_fail_reason = sd.get('supplyFailReason', None)
+    supply_columns    = sd.get('columns', [])
+    inst_raw_won      = sd.get('instRawWon', None)
+    foreign_raw_won   = sd.get('foreignRawWon', None)
+    inst_consec       = sd.get('instConsecutiveDays', 0)
+    foreign_consec    = sd.get('foreignConsecutiveDays', 0)
+
     return {
         'ticker': ticker, 'name': name, 'sector': '',
         'price': int(price), 'change': round(change, 2),
         'volume': int(volume), 'volumeRatio': int(volume_ratio),
         'marketCap': int(market_cap), 'sharesOutstanding': int(shares),
-        'instNetBuy': 0, 'foreignNetBuy': 0, 'retailNetBuy': 0,
-        'instConsecutiveDays': 0, 'foreignConsecutiveDays': 0,
+        'instNetBuy': inst_net, 'foreignNetBuy': foreign_net, 'retailNetBuy': retail_net,
+        'instRawWon': inst_raw_won, 'foreignRawWon': foreign_raw_won,
+        'instConsecutiveDays': inst_consec, 'foreignConsecutiveDays': foreign_consec,
+        'supplyDataAvailable': supply_available, 'supplySource': supply_source,
+        'supplyFailReason': supply_fail_reason, 'supplyColumns': supply_columns,
         'instAlwaysBuy': False, 'instMultipleBuyers': False,
         'creditRatio': 0, 'lendingIncrease': 0,
         'recentDrop': calc_return(5),
@@ -243,8 +385,8 @@ def _build_stock_dict(ticker, name, price, volume, market_cap, per, pbr,
     }
 
 
-def process_stock(info):
-    """pykrx 기반 개별 종목 기술적 분석"""
+def process_stock(info, date_str=None):
+    """pykrx 기반 개별 종목 기술적 분석 + 수급 데이터"""
     ticker     = info['ticker']
     name       = info['name']
     price      = info['price']
@@ -267,8 +409,14 @@ def process_stock(info):
         close     = hist[close_col].astype(float)
         vol_s     = hist[vol_col].astype(float)
 
+        # 수급 데이터 조회
+        supply_date = date_str or end_dt
+        supply_data = get_investor_data(ticker, supply_date)
+        logger.info(f'[{ticker}] {name} 수급 결과: {supply_data}')
+
         return _build_stock_dict(ticker, name, price, volume, market_cap,
-                                 per, pbr, close, vol_s, change, shares)
+                                 per, pbr, close, vol_s, change, shares,
+                                 supply_data=supply_data)
     except Exception as e:
         logger.warning(f'[{ticker}] {name} pykrx 처리 실패: {e}')
         return None
@@ -397,9 +545,26 @@ def get_market_indices(date_str):
 # 업종별 등락률
 # ─────────────────────────────────────────
 
-def get_sectors(date_str):
+def get_sectors(date_str, stocks=None):
+    """업종별 등락률 + 수급 합산"""
     start = (datetime.today() - timedelta(days=5)).strftime('%Y%m%d')
     result = []
+
+    # 종목별 수급을 업종별로 합산
+    sector_supply = {}
+    sector_has_data = {}
+    if stocks:
+        for s in stocks:
+            sector_name = s.get('sector', '') or '기타'
+            if sector_name not in sector_supply:
+                sector_supply[sector_name] = 0
+                sector_has_data[sector_name] = False
+            inst = s.get('instNetBuy')
+            foreign = s.get('foreignNetBuy')
+            if inst is not None or foreign is not None:
+                sector_supply[sector_name] += (inst or 0) + (foreign or 0)
+                sector_has_data[sector_name] = True
+
     for name, code in SECTOR_INDEX_MAP:
         try:
             df = krx.get_index_ohlcv_by_date(start, date_str, code)
@@ -414,7 +579,19 @@ def get_sectors(date_str):
             logger.warning(f'업종 지수 오류 [{name}/{code}]: {e}')
             change = 0.0
         trend = 'up' if change > 0.5 else ('down' if change < -0.5 else 'neutral')
-        result.append({'name': name, 'netBuy': 0, 'change': change, 'trend': trend})
+
+        # 매칭되는 업종의 수급 합산
+        net_buy = sector_supply.get(name, None)
+        has_data = sector_has_data.get(name, False)
+
+        result.append({
+            'name': name,
+            'netBuy': net_buy if has_data else None,
+            'change': change,
+            'trend': trend,
+            'supplyDataAvailable': has_data,
+        })
+
     return result
 
 
@@ -555,7 +732,7 @@ def run_scan():
 
             logger.info(f'분석 대상: {len(stock_infos)}개')
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                futures = {executor.submit(process_stock, info): info['ticker'] for info in stock_infos}
+                futures = {executor.submit(process_stock, info, date_str): info['ticker'] for info in stock_infos}
                 for future in concurrent.futures.as_completed(futures):
                     r = future.result()
                     if r:
@@ -569,7 +746,7 @@ def run_scan():
     elapsed = time.time() - t0
     logger.info(f'분석 완료: {len(results)}개 ({elapsed:.1f}초)')
 
-    sectors = get_sectors(date_str)
+    sectors = get_sectors(date_str, stocks=results)
     market  = get_market_indices(date_str)
 
     data = {'stocks': results, 'market': market, 'sectors': sectors}

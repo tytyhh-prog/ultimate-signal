@@ -56,10 +56,14 @@ export default function SignalCard({ signal, index }) {
                             ULTIMATE 점수: <span className="font-bold text-[var(--color-text-primary)] font-mono">{signal.ultimate.scaledScore}</span>
                             <span className="text-[var(--color-text-muted)]"> / 140</span>
                             {signal.ultimate.supplyStatus === 'missing' && (
-                                <span className="ml-2 text-xs text-yellow-500">⚠️ 수급 API 미수신</span>
+                                <span className="ml-2 text-xs text-yellow-500" title={signal.supplyResult?.supplyReason}>
+                                    ⚠️ 수급 미수신
+                                </span>
                             )}
                             {signal.ultimate.supplyStatus === 'neutral' && (
-                                <span className="ml-2 text-xs text-orange-400">⚠️ 수급 중립 (0억)</span>
+                                <span className="ml-2 text-xs text-orange-400" title={signal.supplyResult?.supplyReason}>
+                                    ⚠️ 수급 중립
+                                </span>
                             )}
                             {signal.ultimate.supplyStatus === 'negative' && (
                                 <span className="ml-2 text-xs text-red-400">🔴 수급 매도세</span>
