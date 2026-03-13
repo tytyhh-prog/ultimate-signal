@@ -26,7 +26,7 @@ def health_root():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'status': 'ok', 'version': 'v5b-traceback'})
+    return jsonify({'ok': True, 'status': 'ok', 'version': 'v6-multilayer'})
 
 
 @app.route('/api/market', methods=['GET'])
@@ -86,6 +86,44 @@ def debug_supply(ticker):
     except Exception as e:
         logger.error(f'[debug/supply/{ticker}] 오류: {e}', exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/debug/krx_raw', methods=['GET'])
+def debug_krx_raw():
+    """KRX API 원본 응답 바이트 진단 — 인코딩 문제 파악용"""
+    import requests as req
+    url = 'https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://data.krx.co.kr/',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    # get_market_trading_value_by_date 에 해당하는 파라미터
+    date_str = scanner.get_last_trading_date()
+    params = {
+        'bld': 'dbms/MDC/STAT/standard/MDCSTAT02201',
+        'trdDd': date_str,
+        'isuCd': 'KR7105560007',  # KB금융 ISIN
+        'share': '1',
+        'money': '1',
+        'csvxls_isNo': 'false',
+    }
+    try:
+        resp = req.post(url, headers=headers, data=params, timeout=10)
+        raw_bytes = resp.content[:200]
+        return jsonify({
+            'status_code': resp.status_code,
+            'encoding': resp.encoding,
+            'content_type': resp.headers.get('Content-Type'),
+            'raw_hex': raw_bytes.hex(),
+            'raw_utf8_attempt': raw_bytes.decode('utf-8', errors='replace'),
+            'raw_cp949_attempt': raw_bytes.decode('cp949', errors='replace'),
+            'json_ok': False,
+            'json_error': None,
+            'json_data_preview': None,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'type': type(e).__name__}), 500
 
 
 @app.route('/api/debug/yf', methods=['GET'])

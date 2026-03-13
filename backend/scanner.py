@@ -14,13 +14,43 @@ import requests
 import io
 
 # ──────────────────────────────────────────────────────────────
-# KRX CP949 인코딩 패치
-# pykrx 내부 KrxWebIo.read()가 resp.json()을 호출할 때
-# KRX 서버가 CP949로 응답 → UnicodeDecodeError 발생
-# requests.Response.json을 패치하여 CP949 자동 재시도
+# KRX CP949 인코딩 패치 (다층 방어)
+# pykrx → KrxWebIo.read() → resp.json() → UnicodeDecodeError
+# 1) KrxWebIo.read() 직접 패치 (가장 확실)
+# 2) requests.Response.json 패치 (fallback)
+# 3) pd.read_csv 패치 (pykrx 버전 호환)
 # ──────────────────────────────────────────────────────────────
 import json as _json
 
+# --- 1) KrxWebIo.read() 직접 패치 ---
+try:
+    from pykrx.website.krx.krxio import KrxWebIo as _KrxWebIo
+
+    _orig_krx_read = _KrxWebIo.read
+
+    def _patched_krx_read(self, **params):
+        try:
+            return _orig_krx_read(self, **params)
+        except (UnicodeDecodeError, UnicodeError) as _e:
+            logger_pre = logging.getLogger(__name__)
+            logger_pre.warning(f'[KrxWebIo.read] UnicodeDecodeError — {_e}, CP949 재시도')
+            # 인코딩 강제 설정 후 재시도
+            _orig_post_read = self.__class__.__mro__[1].read  # Post.read
+            resp = _orig_post_read(self, **params)
+            resp.encoding = 'cp949'
+            try:
+                data = resp.json()
+            except Exception:
+                data = _json.loads(resp.content.decode('cp949'))
+            # KrxWebIo.read()가 반환하는 형식에 맞게 반환
+            return data
+
+    _KrxWebIo.read = _patched_krx_read
+except Exception as _patch_err:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f'KrxWebIo 패치 실패 (무시): {_patch_err}')
+
+# --- 2) requests.Response.json 패치 ---
 _orig_response_json = requests.Response.json
 
 def _safe_response_json(self, **kwargs):
@@ -34,7 +64,7 @@ def _safe_response_json(self, **kwargs):
 
 requests.Response.json = _safe_response_json
 
-# pd.read_csv도 패치 (pykrx 버전에 따라 CSV 파싱 경로 사용 가능)
+# --- 3) pd.read_csv 패치 ---
 _orig_pd_read_csv = pd.read_csv
 
 def _krx_safe_read_csv(filepath_or_buffer, *args, **kwargs):
