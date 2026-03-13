@@ -26,7 +26,7 @@ def health_root():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'status': 'ok', 'version': 'v6b-rawfix'})
+    return jsonify({'ok': True, 'status': 'ok', 'version': 'v6c-lasterr'})
 
 
 @app.route('/api/market', methods=['GET'])
@@ -86,6 +86,24 @@ def debug_supply(ticker):
     except Exception as e:
         logger.error(f'[debug/supply/{ticker}] 오류: {e}', exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/debug/last_error', methods=['GET'])
+def debug_last_error():
+    """마지막 수급 오류 트레이스백 반환 (빠른 진단용)"""
+    return jsonify(scanner._last_supply_error)
+
+
+@app.route('/api/debug/trigger_supply/<ticker>', methods=['GET'])
+def debug_trigger_supply(ticker):
+    """수급 조회를 백그라운드로 트리거 (30초 후 /api/debug/last_error로 확인)"""
+    import threading
+    def _run():
+        date_str = scanner.get_last_trading_date()
+        scanner.get_investor_data(ticker, date_str)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({'triggered': ticker, 'hint': 'Wait ~30s, then GET /api/debug/last_error'})
 
 
 @app.route('/api/debug/krx_raw', methods=['GET'])

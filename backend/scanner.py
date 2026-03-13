@@ -88,6 +88,9 @@ CACHE_TTL = 300
 # 마지막 유효 수급 데이터 캐시 (장외에서 사용)
 _supply_cache = {}
 
+# 마지막 예외 트레이스백 (디버그용)
+_last_supply_error = {'tb': None, 'ticker': None, 'error': None}
+
 # KOSPI 업종 지수 코드 매핑
 SECTOR_INDEX_MAP = [
     ('2차전지/전기차', '1008'),
@@ -390,10 +393,12 @@ def get_investor_data(ticker, date_str):
     except UnicodeDecodeError as e:
         # KRX 응답이 CP949인데 pykrx가 UTF-8로 읽으려다 실패
         # → KRX API 직접 호출 (CP949 명시) 로 폴백
-        import traceback
+        import traceback as _tb
         reason_pykrx = f'pykrx UnicodeDecodeError (CP949/UTF-8 인코딩 불일치): {e}'
+        tb_str = _tb.format_exc()
+        _last_supply_error.update({'tb': tb_str, 'ticker': ticker, 'error': reason_pykrx})
         logger.warning(f'[{ticker}] {reason_pykrx} → KRX direct 폴백 시도')
-        logger.warning(f'[{ticker}] 전체 스택트레이스:\n{traceback.format_exc()}')
+        logger.warning(f'[{ticker}] 전체 스택트레이스:\n{tb_str}')
 
         direct = get_investor_data_direct(ticker, date_str)
         if direct:
