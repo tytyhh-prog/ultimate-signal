@@ -417,8 +417,11 @@ def get_investor_data(ticker, date_str):
                 'supplyFailReason': reason_pykrx, 'columns': []}
 
     except Exception as e:
+        import traceback as _tb2
         reason = f'{type(e).__name__}: {e}'
-        logger.error(f'[{ticker}] 수급 조회 예외 — {reason}')
+        tb_str2 = _tb2.format_exc()
+        _last_supply_error.update({'tb': tb_str2, 'ticker': ticker, 'error': reason})
+        logger.error(f'[{ticker}] 수급 조회 예외 — {reason}\n{tb_str2}')
         if ticker in _supply_cache:
             cached = _supply_cache[ticker].copy()
             cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
