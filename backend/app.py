@@ -29,6 +29,21 @@ def health():
     return jsonify({'ok': True, 'status': 'ok', 'version': 'v4-debug'})
 
 
+@app.route('/api/market', methods=['GET'])
+def market_indices():
+    """KOSPI/KOSDAQ 지수만 빠르게 반환 (스캔 없이)"""
+    try:
+        date_str = scanner.get_last_trading_date()
+        data = scanner.get_market_indices(date_str)
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f'시장 지수 오류: {e}', exc_info=True)
+        return jsonify({
+            'kospi': 0, 'kospiChange': 0, 'kosdaq': 0, 'kosdaqChange': 0,
+            'marketStatus': 'closed', 'kospiAbove200': True,
+        }), 500
+
+
 @app.route('/api/scan', methods=['GET'])
 def scan():
     try:

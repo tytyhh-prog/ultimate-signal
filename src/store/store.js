@@ -6,8 +6,47 @@ import { calculateSupplyScore, classifySupplyPattern } from '../engines/supplyEn
 import { calculateTraderScore } from '../engines/traderEngine';
 import { calculateQuantScore } from '../engines/quantEngine';
 import { calculateUltimateScore, calculateTargets } from '../engines/ultimateScorer';
+import { fetchMarketData as fetchMarketDataApi } from '../api/backendApi';
 
 const IS_DEMO = import.meta.env.VITE_USE_DEMO === 'true';
+
+// 장중 갱신 간격: 10초
+const MARKET_OPEN_INTERVAL = 10 * 1000;
+// 장외 갱신 간격: 5분
+const MARKET_CLOSED_INTERVAL = 5 * 60 * 1000;
+// 에러 발생 시 재시도 간격: 30초
+const ERROR_RETRY_INTERVAL = 30 * 1000;
+
+/**
+ * 한국 장 시간 체크 (KST 09:00~15:30)
+ * UTC 기반으로 계산하여 정확한 KST 시간 획득
+ */
+export function isKoreanMarketOpen() {
+    const now = new Date();
+    // UTC 시간에 +9시간을 더해 KST 획득
+    const utcHours = now.getUTCHours();
+    const utcMinutes = now.getUTCMinutes();
+    const kstTotalMinutes = (utcHours * 60 + utcMinutes + 9 * 60) % (24 * 60);
+    const kstHours = Math.floor(kstTotalMinutes / 60);
+    const kstMinutes = kstTotalMinutes % 60;
+
+    // KST 기준 요일 체크 (토/일 제외)
+    const utcDay = now.getUTCDay();
+    // KST 날짜 경계 보정
+    const kstDayOffset = (utcHours + 9 >= 24) ? 1 : 0;
+    const kstDay = (utcDay + kstDayOffset) % 7;
+    if (kstDay === 0 || kstDay === 6) {
+        console.log(`[장시간] KST ${kstHours}:${String(kstMinutes).padStart(2, '0')} — 주말(${kstDay === 0 ? '일' : '토'}요일) → 장외`);
+        return false;
+    }
+
+    const marketOpen = kstHours * 60 + kstMinutes >= 9 * 60;       // 09:00 이후
+    const marketClose = kstHours * 60 + kstMinutes <= 15 * 60 + 30; // 15:30 이전
+    const isOpen = marketOpen && marketClose;
+
+    console.log(`[장시간] KST ${kstHours}:${String(kstMinutes).padStart(2, '0')} — ${isOpen ? '🟢 장중' : '🔴 장외'}`);
+    return isOpen;
+}
 
 const useStore = create((set, get) => ({
     // 상태
@@ -22,10 +61,30 @@ const useStore = create((set, get) => ({
     refreshInterval: null,
     scanned: false,
     error: null,
+    lastUpdated: null,       // 마지막 갱신 시각
+    marketOpen: false,        // 현재 장 상태
+    errorRetryTimeout: null,  // 에러 재시도 타이머
 
-    // 스캔 실행
+    // 시장 지수만 빠르게 조회 (페이지 로딩 시 1회 — 스캔 없이)
+    fetchMarketData: async () => {
+        try {
+            console.log('[fetchMarketData] KOSPI/KOSDAQ 지수 로딩 중...');
+            const data = await fetchMarketDataApi();
+            set({ market: data });
+            console.log(`[fetchMarketData] 완료 — KOSPI: ${data.kospi}, KOSDAQ: ${data.kosdaq}`);
+        } catch (err) {
+            console.warn('[fetchMarketData] 시장 지수 로드 실패:', err.message);
+        }
+    },
+
+    // 스캔 실행 (버튼 클릭 시에만 호출)
     runScan: async () => {
+        console.log('[runScan] analysis start triggered — 버튼 클릭으로 시작');
         set({ loading: true, step: '초기화 중...', progress: 2, error: null, signals: [] });
+
+        // 장 상태 업데이트
+        const isOpen = isKoreanMarketOpen();
+        set({ marketOpen: isOpen });
 
         try {
             if (IS_DEMO) {
@@ -37,6 +96,7 @@ const useStore = create((set, get) => ({
             set({ step: '백엔드 서버 연결 중... (첫 실행 시 1-2분 소요)', progress: 5 });
 
             set({ step: 'KOSPI/KOSDAQ 전종목 데이터 수집 중...', progress: 15 });
+            console.log(`[runScan] 스캔 시작 — 장 상태: ${isOpen ? '장중' : '장외'}`);
             const data = await fetchScanData();
 
             const stockCount = data.stocks?.length ?? 0;
@@ -48,7 +108,7 @@ const useStore = create((set, get) => ({
             });
 
             if (stockCount === 0) {
-                set({ loading: false, step: '종목 없음', progress: 100, scanned: true, signals: [], error: null });
+                set({ loading: false, step: '종목 없음', progress: 100, scanned: true, signals: [], error: null, lastUpdated: new Date() });
                 return;
             }
 
@@ -68,6 +128,11 @@ const useStore = create((set, get) => ({
             console.log(`[runScan] 수집된 종목: ${scored.length}개`);
             console.log('[runScan] 점수 분포:', scored.map(s => `${s.name}:${s.ultimate.scaledScore}`).join(', '));
 
+            // 수급 데이터 상세 로그
+            scored.forEach(s => {
+                console.log(`[runScan] ${s.name} 수급: 기관 ${s.instNetBuy}억, 외국인 ${s.foreignNetBuy}억, 개인 ${s.retailNetBuy}억, 거래량 ${s.volume?.toLocaleString()}`);
+            });
+
             // 점수 ≥ 60 우선, 없으면 상위 5개 반환
             const sorted = scored.sort((a, b) => b.ultimate.scaledScore - a.ultimate.scaledScore);
             const above60 = sorted.filter(r => r.ultimate.scaledScore >= 60);
@@ -86,6 +151,7 @@ const useStore = create((set, get) => ({
                 step: '완료',
                 progress: 100,
                 scanned: true,
+                lastUpdated: new Date(),
             });
 
             // DIAMOND 등급 푸시 알림
@@ -103,20 +169,66 @@ const useStore = create((set, get) => ({
             set({
                 loading: false, step: '오류 발생', progress: 0,
                 scanned: true, signals: [],
-                error: `백엔드 오류: ${err.message}`,
+                error: `실시간 데이터 오류: ${err.message}`,
+                lastUpdated: new Date(),
             });
+
+            // 에러 발생 시 30초 후 자동 재시도
+            const prevTimeout = get().errorRetryTimeout;
+            if (prevTimeout) clearTimeout(prevTimeout);
+
+            const retryTimeout = setTimeout(() => {
+                console.log('[runScan] ⏰ 에러 후 자동 재시도 실행');
+                get().runScan();
+            }, ERROR_RETRY_INTERVAL);
+            set({ errorRetryTimeout: retryTimeout });
         }
     },
 
-    // 자동 갱신
+    // 자동 갱신 — 장중 10초 / 장외 5분
     toggleAutoRefresh: () => {
         const state = get();
         if (state.autoRefresh) {
             clearInterval(state.refreshInterval);
             set({ autoRefresh: false, refreshInterval: null });
+            console.log('[자동갱신] OFF');
         } else {
-            const interval = setInterval(() => { get().runScan(); }, 5 * 60 * 1000);
-            set({ autoRefresh: true, refreshInterval: interval });
+            const isOpen = isKoreanMarketOpen();
+            const interval = isOpen ? MARKET_OPEN_INTERVAL : MARKET_CLOSED_INTERVAL;
+            console.log(`[자동갱신] ON — ${isOpen ? '장중 10초' : '장외 5분'} 간격`);
+
+            const id = setInterval(() => {
+                // 매 갱신마다 장 상태 재체크 → 간격 자동 전환
+                const currentOpen = isKoreanMarketOpen();
+                const currentState = get();
+
+                // 장 상태 변경 시 간격 재설정
+                if (currentOpen !== currentState.marketOpen) {
+                    console.log(`[자동갱신] 장 상태 변경: ${currentOpen ? '장외→장중' : '장중→장외'} — 간격 재설정`);
+                    clearInterval(currentState.refreshInterval);
+                    set({ marketOpen: currentOpen });
+
+                    const newInterval = currentOpen ? MARKET_OPEN_INTERVAL : MARKET_CLOSED_INTERVAL;
+                    const newId = setInterval(() => { get().runScan(); }, newInterval);
+                    set({ refreshInterval: newId });
+                }
+
+                get().runScan();
+            }, interval);
+
+            set({ autoRefresh: true, refreshInterval: id, marketOpen: isOpen });
+        }
+    },
+
+    // 장중 자동갱신 시작 — runScan()은 포함하지 않음 (버튼 클릭 시에만 스캔)
+    startMarketAutoRefresh: () => {
+        const state = get();
+        if (state.autoRefresh) return;
+
+        const isOpen = isKoreanMarketOpen();
+        if (isOpen) {
+            console.log('[자동시작] 장중 감지 → 자동갱신 ON (첫 스캔은 버튼 클릭으로 시작)');
+            get().toggleAutoRefresh();
         }
     },
 
@@ -164,7 +276,7 @@ async function runDemoScan(set) {
     await delay(300);
     set({ step: 'AI 분석 생성 중...', progress: 95 });
     await delay(500);
-    set({ signals: filtered, loading: false, step: '완료', progress: 100, scanned: true, sectors: DEMO_SECTORS });
+    set({ signals: filtered, loading: false, step: '완료', progress: 100, scanned: true, sectors: DEMO_SECTORS, lastUpdated: new Date() });
 }
 
 

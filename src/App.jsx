@@ -12,14 +12,23 @@ export default function App() {
   const scanned = useStore(s => s.scanned);
   const error = useStore(s => s.error);
   const requestNotification = useStore(s => s.requestNotification);
+  const fetchMarketData = useStore(s => s.fetchMarketData);
+  const runScan = useStore(s => s.runScan);
 
   useEffect(() => {
     // 알림 권한 요청
     requestNotification();
+
+    // 페이지 로딩 시 시장 지수(KOSPI/KOSDAQ)만 1회 fetch — 스캔은 버튼 클릭 시 실행
+    fetchMarketData();
   }, []);
 
   return (
     <div className="min-h-screen bg-[var(--color-bg-primary)] pb-16">
+      {/* DEPLOY TEST 0313 */}
+      <div style={{background:'red',color:'white',textAlign:'center',padding:'8px',fontWeight:'bold',fontSize:'18px',letterSpacing:'2px'}}>
+        DEPLOY TEST 0313
+      </div>
       <Header />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6">
@@ -42,16 +51,22 @@ export default function App() {
               <>
                 <div className="text-4xl mb-4">⚠️</div>
                 <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">
-                  API 오류 발생
+                  실시간 데이터 오류
                 </h3>
                 <p className="text-sm text-[var(--color-text-secondary)] mb-2">
                   {error}
                 </p>
-                <p className="text-xs text-[var(--color-text-secondary)] mt-2 font-mono bg-[var(--color-bg-secondary)] px-3 py-2 rounded inline-block">
+                <button
+                  onClick={() => runScan()}
+                  className="mt-3 px-5 py-2 rounded-lg bg-[var(--color-supply-bar)]/20 border border-[var(--color-supply-bar)]/50 text-[var(--color-supply-bar)] text-sm font-semibold hover:bg-[var(--color-supply-bar)]/30 transition-colors cursor-pointer"
+                >
+                  🔄 지금 재시도
+                </button>
+                <p className="text-xs text-[var(--color-text-secondary)] mt-3 font-mono bg-[var(--color-bg-secondary)] px-3 py-2 rounded inline-block">
                   백엔드: {import.meta.env.VITE_BACKEND_URL || '(env 미설정 — localhost:5000)'}
                 </p>
                 <p className="text-xs text-[var(--color-text-secondary)] mt-2">
-                  브라우저 F12 → Console 탭에서 상세 오류를 확인하세요.
+                  30초 후 자동 재시도됩니다. 브라우저 F12 → Console 탭에서 상세 오류를 확인하세요.
                 </p>
               </>
             ) : (
