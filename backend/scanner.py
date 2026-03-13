@@ -13,6 +13,26 @@ import pytz
 import requests
 import io
 
+# ──────────────────────────────────────────────────────────────
+# pd.read_csv 인코딩 패치
+# KRX API 응답이 CP949인데 pykrx가 UTF-8로 읽으려다 실패하는 문제 수정
+# UTF-8 디코딩 실패 시 자동으로 CP949 재시도
+# ──────────────────────────────────────────────────────────────
+_orig_pd_read_csv = pd.read_csv
+
+def _krx_safe_read_csv(filepath_or_buffer, *args, **kwargs):
+    try:
+        return _orig_pd_read_csv(filepath_or_buffer, *args, **kwargs)
+    except (UnicodeDecodeError, UnicodeError):
+        # UTF-8 실패 → CP949 재시도
+        if hasattr(filepath_or_buffer, 'seek'):
+            filepath_or_buffer.seek(0)
+        new_kwargs = dict(kwargs)
+        new_kwargs['encoding'] = 'cp949'
+        return _orig_pd_read_csv(filepath_or_buffer, *args, **new_kwargs)
+
+pd.read_csv = _krx_safe_read_csv
+
 logger = logging.getLogger(__name__)
 
 # 5분 캐시
