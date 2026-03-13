@@ -63,7 +63,7 @@ const useStore = create((set, get) => ({
     error: null,
     lastUpdated: null,       // 마지막 갱신 시각
     marketOpen: false,        // 현재 장 상태
-    errorRetryTimeout: null,  // 에러 재시도 타이머
+    errorRetryTimeout: null,  // (미사용 — 자동 재시도 제거됨)
 
     // 시장 지수만 빠르게 조회 (페이지 로딩 시 1회 — 스캔 없이)
     fetchMarketData: async () => {
@@ -80,7 +80,8 @@ const useStore = create((set, get) => ({
     // 스캔 실행 (버튼 클릭 시에만 호출)
     runScan: async () => {
         console.log('[runScan] analysis start triggered — 버튼 클릭으로 시작');
-        set({ loading: true, step: '초기화 중...', progress: 2, error: null, signals: [] });
+        // signals는 초기화하지 않음 — scan 완료 시에만 덮어씀 (깜빡임 방지)
+        set({ loading: true, step: '초기화 중...', progress: 2, error: null });
 
         // 장 상태 업데이트
         const isOpen = isKoreanMarketOpen();
@@ -173,19 +174,14 @@ const useStore = create((set, get) => ({
                 lastUpdated: new Date(),
             });
 
-            // 에러 발생 시 30초 후 자동 재시도
+            // 에러 발생 시 자동 재시도 없음 — 사용자가 버튼을 직접 눌러야 재실행
             const prevTimeout = get().errorRetryTimeout;
             if (prevTimeout) clearTimeout(prevTimeout);
-
-            const retryTimeout = setTimeout(() => {
-                console.log('[runScan] ⏰ 에러 후 자동 재시도 실행');
-                get().runScan();
-            }, ERROR_RETRY_INTERVAL);
-            set({ errorRetryTimeout: retryTimeout });
         }
     },
 
-    // 자동 갱신 — 장중 10초 / 장외 5분
+    // 자동 갱신 — 시장 지수만 갱신 (scan 실행 금지)
+    // 장중 10초 / 장외 5분 간격으로 fetchMarketData()만 호출
     toggleAutoRefresh: () => {
         const state = get();
         if (state.autoRefresh) {
@@ -195,7 +191,7 @@ const useStore = create((set, get) => ({
         } else {
             const isOpen = isKoreanMarketOpen();
             const interval = isOpen ? MARKET_OPEN_INTERVAL : MARKET_CLOSED_INTERVAL;
-            console.log(`[자동갱신] ON — ${isOpen ? '장중 10초' : '장외 5분'} 간격`);
+            console.log(`[자동갱신] ON — ${isOpen ? '장중 10초' : '장외 5분'} 간격 (시장지수만 갱신, scan 없음)`);
 
             const id = setInterval(() => {
                 // 매 갱신마다 장 상태 재체크 → 간격 자동 전환
@@ -209,11 +205,12 @@ const useStore = create((set, get) => ({
                     set({ marketOpen: currentOpen });
 
                     const newInterval = currentOpen ? MARKET_OPEN_INTERVAL : MARKET_CLOSED_INTERVAL;
-                    const newId = setInterval(() => { get().runScan(); }, newInterval);
+                    const newId = setInterval(() => { get().fetchMarketData(); }, newInterval);
                     set({ refreshInterval: newId });
                 }
 
-                get().runScan();
+                // scan 금지 — 시장 지수만 갱신
+                get().fetchMarketData();
             }, interval);
 
             set({ autoRefresh: true, refreshInterval: id, marketOpen: isOpen });
