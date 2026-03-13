@@ -26,7 +26,7 @@ def health_root():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'status': 'ok', 'version': 'v4-debug'})
+    return jsonify({'ok': True, 'status': 'ok', 'version': 'v5-cp949fix'})
 
 
 @app.route('/api/market', methods=['GET'])

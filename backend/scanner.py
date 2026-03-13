@@ -14,17 +14,33 @@ import requests
 import io
 
 # ──────────────────────────────────────────────────────────────
-# pd.read_csv 인코딩 패치
-# KRX API 응답이 CP949인데 pykrx가 UTF-8로 읽으려다 실패하는 문제 수정
-# UTF-8 디코딩 실패 시 자동으로 CP949 재시도
+# KRX CP949 인코딩 패치
+# pykrx 내부 KrxWebIo.read()가 resp.json()을 호출할 때
+# KRX 서버가 CP949로 응답 → UnicodeDecodeError 발생
+# requests.Response.json을 패치하여 CP949 자동 재시도
 # ──────────────────────────────────────────────────────────────
+import json as _json
+
+_orig_response_json = requests.Response.json
+
+def _safe_response_json(self, **kwargs):
+    try:
+        return _orig_response_json(self, **kwargs)
+    except (UnicodeDecodeError, UnicodeError, ValueError):
+        try:
+            return _json.loads(self.content.decode('cp949'))
+        except Exception:
+            raise
+
+requests.Response.json = _safe_response_json
+
+# pd.read_csv도 패치 (pykrx 버전에 따라 CSV 파싱 경로 사용 가능)
 _orig_pd_read_csv = pd.read_csv
 
 def _krx_safe_read_csv(filepath_or_buffer, *args, **kwargs):
     try:
         return _orig_pd_read_csv(filepath_or_buffer, *args, **kwargs)
     except (UnicodeDecodeError, UnicodeError):
-        # UTF-8 실패 → CP949 재시도
         if hasattr(filepath_or_buffer, 'seek'):
             filepath_or_buffer.seek(0)
         new_kwargs = dict(kwargs)
