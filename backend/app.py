@@ -26,7 +26,7 @@ def health_root():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'status': 'ok', 'version': 'v6-multilayer'})
+    return jsonify({'ok': True, 'status': 'ok', 'version': 'v6b-rawfix'})
 
 
 @app.route('/api/market', methods=['GET'])
@@ -101,8 +101,9 @@ def debug_krx_raw():
     # get_market_trading_value_by_date 에 해당하는 파라미터
     date_str = scanner.get_last_trading_date()
     params = {
-        'bld': 'dbms/MDC/STAT/standard/MDCSTAT02201',
-        'trdDd': date_str,
+        'bld': 'dbms/MDC/STAT/standard/MDCSTAT02202',
+        'strtDd': date_str,
+        'endDd': date_str,
         'isuCd': 'KR7105560007',  # KB금융 ISIN
         'share': '1',
         'money': '1',
@@ -110,17 +111,26 @@ def debug_krx_raw():
     }
     try:
         resp = req.post(url, headers=headers, data=params, timeout=10)
-        raw_bytes = resp.content[:200]
+        raw_bytes = resp.content[:300]
+        json_ok = False
+        json_error = None
+        json_preview = None
+        try:
+            j = resp.json()
+            json_ok = True
+            out = j.get('output', [])
+            json_preview = out[:2] if isinstance(out, list) else str(j)[:200]
+        except Exception as je:
+            json_error = f'{type(je).__name__}: {je}'
         return jsonify({
             'status_code': resp.status_code,
             'encoding': resp.encoding,
             'content_type': resp.headers.get('Content-Type'),
             'raw_hex': raw_bytes.hex(),
             'raw_utf8_attempt': raw_bytes.decode('utf-8', errors='replace'),
-            'raw_cp949_attempt': raw_bytes.decode('cp949', errors='replace'),
-            'json_ok': False,
-            'json_error': None,
-            'json_data_preview': None,
+            'json_ok': json_ok,
+            'json_error': json_error,
+            'json_data_preview': json_preview,
         })
     except Exception as e:
         return jsonify({'error': str(e), 'type': type(e).__name__}), 500
