@@ -299,7 +299,22 @@ def get_investor_data(ticker, date_str):
     global _supply_cache
     try:
         start = (datetime.today() - timedelta(days=10)).strftime('%Y%m%d')
-        df = krx.get_market_trading_value_by_date(start, date_str, ticker)
+        # pykrx는 KRX API에 타임아웃 없이 요청 → 클라우드에서 무한 대기 방지
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(krx.get_market_trading_value_by_date, start, date_str, ticker)
+            try:
+                df = _fut.result(timeout=15)
+            except _cf.TimeoutError:
+                reason_timeout = f'pykrx 타임아웃 (15초 초과) — KRX API 응답 없음 (start={start}, date={date_str})'
+                logger.warning(f'[{ticker}] {reason_timeout}')
+                if ticker in _supply_cache:
+                    cached = _supply_cache[ticker].copy()
+                    cached.update({'supplyDataAvailable': False, 'supplySource': 'cache',
+                                    'supplyFailReason': reason_timeout + ' → 캐시 사용'})
+                    return cached
+                return {'supplyDataAvailable': False, 'supplySource': 'none',
+                        'supplyFailReason': reason_timeout, 'columns': []}
 
         if df is None or len(df) == 0:
             reason = f'pykrx 빈 DataFrame (start={start}, date={date_str})'
