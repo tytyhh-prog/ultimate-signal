@@ -120,6 +120,20 @@ def debug_trigger_supply(ticker):
         })
 
 
+@app.route('/api/debug/kis_token', methods=['GET'])
+def debug_kis_token():
+    """KIS OpenAPI 토큰 발급 테스트"""
+    import os
+    app_key = (os.environ.get('KIS_APP_KEY') or
+               os.environ.get('VITE_KIS_APP_KEY', '')).strip()
+    token = scanner.get_kis_token()
+    return jsonify({
+        'has_app_key': bool(app_key),
+        'token_ok': bool(token),
+        'token_preview': (token[:20] + '...') if token else None,
+    })
+
+
 @app.route('/api/debug/krx_raw', methods=['GET'])
 def debug_krx_raw():
     """KRX API 원본 응답 바이트 진단 — 인코딩 문제 파악용"""

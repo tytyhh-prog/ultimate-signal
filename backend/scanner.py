@@ -8,6 +8,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import concurrent.futures
 import logging
+import os
 import time
 import pytz
 import requests
@@ -90,6 +91,10 @@ _supply_cache = {}
 
 # 마지막 예외 트레이스백 (디버그용)
 _last_supply_error = {'tb': None, 'ticker': None, 'error': None}
+
+# KIS 액세스 토큰 캐시 (24시간 유효)
+_kis_token_cache = {'token': None, 'expires_at': 0}
+_KIS_BASE_URL = 'https://openapi.koreainvestment.com:9443'
 
 # KOSPI 업종 지수 코드 매핑
 SECTOR_INDEX_MAP = [
@@ -179,6 +184,172 @@ def get_col(df, candidates, fallback_idx=None):
     if fallback_idx is not None and len(df.columns) > fallback_idx:
         return df.columns[fallback_idx]
     return None
+
+
+# ─────────────────────────────────────────
+# KIS OpenAPI 인증 토큰
+# ─────────────────────────────────────────
+
+def get_kis_token():
+    """
+    KIS OpenAPI 액세스 토큰 발급/캐시
+    환경변수: KIS_APP_KEY / KIS_APP_SECRET (또는 VITE_ 접두사 버전)
+    토큰은 24시간 유효 → 캐시로 재사용
+    """
+    global _kis_token_cache
+    now = time.time()
+    if _kis_token_cache['token'] and now < _kis_token_cache['expires_at']:
+        return _kis_token_cache['token']
+
+    app_key = (os.environ.get('KIS_APP_KEY') or
+               os.environ.get('VITE_KIS_APP_KEY', '')).strip()
+    app_secret = (os.environ.get('KIS_APP_SECRET') or
+                  os.environ.get('VITE_KIS_APP_SECRET', '')).strip()
+
+    if not app_key or not app_secret:
+        logger.warning('KIS_APP_KEY / KIS_APP_SECRET 환경변수 없음')
+        return None
+
+    try:
+        resp = requests.post(
+            f'{_KIS_BASE_URL}/oauth2/tokenP',
+            json={
+                'grant_type': 'client_credentials',
+                'appkey': app_key,
+                'appsecret': app_secret,
+            },
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        data = resp.json()
+        token = data.get('access_token')
+        if not token:
+            logger.warning(f'KIS 토큰 발급 실패: {data}')
+            return None
+        # 만료 23시간 후로 설정 (여유 1시간)
+        _kis_token_cache['token'] = token
+        _kis_token_cache['expires_at'] = now + 23 * 3600
+        logger.info('KIS 액세스 토큰 발급 성공')
+        return token
+    except Exception as e:
+        logger.warning(f'KIS 토큰 발급 예외: {e}')
+        return None
+
+
+# ─────────────────────────────────────────
+# KIS OpenAPI 기반 투자자별 수급 조회
+# ─────────────────────────────────────────
+
+def get_investor_data_kis(ticker):
+    """
+    KIS OpenAPI - 주식 현재가 투자자 (tr_id: FHKST01010900)
+    /uapi/domestic-stock/v1/quotations/inquire-investor
+
+    output1: 최근 30거래일 투자자별 순매수 (날짜 내림차순)
+      - frgn_ntby_tr_pbmn : 외국인 순매수거래대금 (원)
+      - orgn_ntby_tr_pbmn : 기관 순매수거래대금 (원)
+      - prsn_ntby_tr_pbmn : 개인 순매수거래대금 (원)
+    """
+    app_key = (os.environ.get('KIS_APP_KEY') or
+               os.environ.get('VITE_KIS_APP_KEY', '')).strip()
+    app_secret = (os.environ.get('KIS_APP_SECRET') or
+                  os.environ.get('VITE_KIS_APP_SECRET', '')).strip()
+
+    token = get_kis_token()
+    if not token:
+        return None
+
+    headers = {
+        'content-type': 'application/json',
+        'authorization': f'Bearer {token}',
+        'appkey': app_key,
+        'appsecret': app_secret,
+        'tr_id': 'FHKST01010900',
+    }
+    params = {
+        'FID_COND_MRKT_DIV_CODE': 'J',
+        'FID_INPUT_ISCD': ticker,
+    }
+
+    try:
+        resp = requests.get(
+            f'{_KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor',
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f'[{ticker}] KIS inquire-investor 요청 예외: {e}')
+        return None
+
+    rt_cd = data.get('rt_cd')
+    if rt_cd != '0':
+        msg = data.get('msg1', '')
+        logger.warning(f'[{ticker}] KIS API 오류 rt_cd={rt_cd}: {msg}')
+        # 토큰 만료 시 캐시 무효화
+        if rt_cd in ('1', 'EGW00123', 'EGW00121'):
+            _kis_token_cache['token'] = None
+            _kis_token_cache['expires_at'] = 0
+        return None
+
+    output1 = data.get('output1', [])
+    if not output1:
+        logger.warning(f'[{ticker}] KIS output1 비어있음')
+        return None
+
+    # output1[0]이 최신 거래일 (날짜 내림차순)
+    latest = output1[0]
+    logger.info(f'[{ticker}] KIS investor 최신: {latest}')
+
+    def to_won(val):
+        try:
+            return float(str(val).replace(',', '')) if val else 0.0
+        except Exception:
+            return 0.0
+
+    inst_raw_won    = to_won(latest.get('orgn_ntby_tr_pbmn'))
+    foreign_raw_won = to_won(latest.get('frgn_ntby_tr_pbmn'))
+    retail_raw_won  = to_won(latest.get('prsn_ntby_tr_pbmn'))
+
+    inst_net    = round(inst_raw_won    / 100_000_000, 1)
+    foreign_net = round(foreign_raw_won / 100_000_000, 1)
+    retail_net  = round(retail_raw_won  / 100_000_000, 1)
+
+    logger.info(f'[{ticker}] KIS 수급: 기관={inst_net}억, 외국인={foreign_net}억, 개인={retail_net}억')
+
+    # 연속 매수일 계산 (output1은 내림차순 — 최신 → 과거)
+    inst_consecutive = 0
+    foreign_consecutive = 0
+    for row in output1:
+        if to_won(row.get('orgn_ntby_tr_pbmn')) > 0:
+            inst_consecutive += 1
+        else:
+            break
+    for row in output1:
+        if to_won(row.get('frgn_ntby_tr_pbmn')) > 0:
+            foreign_consecutive += 1
+        else:
+            break
+
+    both_zero = (inst_net == 0) and (foreign_net == 0)
+    fail_reason = None
+    if both_zero:
+        fail_reason = f'KIS: 기관+외국인 모두 0억 (원: {inst_raw_won}/{foreign_raw_won})'
+
+    return {
+        'instNetBuy':             inst_net,
+        'foreignNetBuy':          foreign_net,
+        'retailNetBuy':           retail_net,
+        'instRawWon':             inst_raw_won,
+        'foreignRawWon':          foreign_raw_won,
+        'instConsecutiveDays':    inst_consecutive,
+        'foreignConsecutiveDays': foreign_consecutive,
+        'supplyDataAvailable':    True,
+        'supplySource':           'live' if is_market_open() else 'closing',
+        'supplyFailReason':       fail_reason,
+        'columns':                list(latest.keys()),
+    }
 
 
 # ─────────────────────────────────────────
@@ -288,15 +459,31 @@ def get_investor_data_direct(ticker, date_str):
 def get_investor_data(ticker, date_str):
     """
     종목별 기관/외국인/개인 순매수 데이터 조회
+    우선순위: KIS OpenAPI → pykrx → KRX direct HTTP → 캐시
+
     반환 필드:
       instNetBuy / foreignNetBuy / retailNetBuy  — 억원 (소수점 1자리)
       instRawWon / foreignRawWon                 — 원 단위 실제값 (디버그용)
       supplyDataAvailable                        — True/False
       supplySource                               — live/closing/cache/none
       supplyFailReason                           — 실패 시 구체 이유
-      columns                                    — pykrx 응답 컬럼 목록
+      columns                                    — 응답 컬럼 목록
     """
     global _supply_cache
+
+    # ── 1순위: KIS OpenAPI ────────────────────────────────────────
+    try:
+        kis_result = get_investor_data_kis(ticker)
+        if kis_result and kis_result.get('supplyDataAvailable'):
+            if kis_result.get('instNetBuy') is not None or kis_result.get('foreignNetBuy') is not None:
+                _supply_cache[ticker] = kis_result.copy()
+            return kis_result
+        elif kis_result:
+            logger.info(f'[{ticker}] KIS 결과 없음 (supplyDataAvailable=False) → pykrx 시도')
+    except Exception as _kis_e:
+        logger.warning(f'[{ticker}] KIS 예외 — {_kis_e} → pykrx 시도')
+
+    # ── 2순위: pykrx ─────────────────────────────────────────────
     try:
         start = (datetime.today() - timedelta(days=10)).strftime('%Y%m%d')
         # pykrx는 KRX API에 타임아웃 없이 요청 → 클라우드에서 무한 대기 방지
